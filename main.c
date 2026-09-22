@@ -11,22 +11,38 @@ int main(void) {
         return 1;
     }
 
-    int rect_x = 100;
+    int player_x = 400;
+    int player_y = 250;
+    int speed = 4;
 
     // Boucle principale d'affichage
     while (eventsWin(win)) {
-        // 1. Effacer le fond avec un bleu foncé (0x000F172A)
-        clearWin(win, 0x000F172A);
+        // Quitter avec Échap
+        if (isKeyDown(win, GT_KEY_ESCAPE)) break;
 
-        // 2. Dessiner un rectangle rouge/rose (0x00F43F5E) qui se déplace
-        drawRect(win, rect_x, 200, 150, 100, GT_GREEN);
-        
-        // Fait défiler le rectangle vers la droite
-        rect_x += 2;
-        if (rect_x > win->width) rect_x = -150;
+        // Déplacement Clavier (ZQSD / Flèches)
+        if (isKeyDown(win, GT_KEY_D) || isKeyDown(win, GT_KEY_RIGHT)) player_x += speed;
+        if (isKeyDown(win, GT_KEY_A) || isKeyDown(win, GT_KEY_LEFT))  player_x -= speed;
+        if (isKeyDown(win, GT_KEY_S) || isKeyDown(win, GT_KEY_DOWN))  player_y += speed;
+        if (isKeyDown(win, GT_KEY_W) || isKeyDown(win, GT_KEY_UP))    player_y -= speed;
 
-        // 3. Envoyer le buffer à l'écran
+        // Rendu
+        clearWin(win, GT_DARKGRAY);
+
+        // Dessiner le joueur
+        drawRect(win, player_x, player_y, 50, 50, GT_RED);
+
+        // Dessiner un petit carré sous le curseur si le clic gauche est maintenu
+        if (isMouseButtonDown(win, GT_MOUSE_BUTTON_LEFT)) {
+            int mx, my;
+            getMousePos(win, &mx, &my);
+            drawRect(win, mx - 10, my - 10, 20, 20, GT_BLUE);
+        }
+
         updateWin(win);
+
+        // Bridage du CPU (~60 FPS)
+        Sleep(16);
     }
 
     destroyWin(win);
