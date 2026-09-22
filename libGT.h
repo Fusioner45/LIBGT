@@ -5,26 +5,6 @@
 #include <stdint.h>
 
 /* =========================================================================
- * PALETTE DE COULEURS DE BASE (Format 0x00RRGGBB)
- * ========================================================================= */
-
-#define GT_BLACK      0x00000000
-#define GT_WHITE      0x00FFFFFF
-#define GT_RED        0x00FF0000
-#define GT_GREEN      0x0000FF00
-#define GT_BLUE       0x000000FF
-#define GT_YELLOW     0x00FFFF00
-#define GT_MAGENTA    0x00FF00FF
-#define GT_CYAN       0x0000FFFF
-#define GT_GRAY       0x00808080
-#define GT_LIGHTGRAY  0x00D3D3D3
-#define GT_DARKGRAY   0x000F172A
-#define GT_ORANGE     0x00FFA500
-
-/* Macro utilitaire pour fabriquer une couleur custom a partir de R, G, B (0 à 255) */
-#define GT_RGB(r, g, b) (((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
-
-/* =========================================================================
  * API PUBLIQUE (Déclarations)
  * ========================================================================= */
 
@@ -47,7 +27,7 @@ MyWindow* createWin(const char* title, int width, int height);
 void destroyWin(MyWindow* window);
 
 /**
- * Depile et traite tous les événements système Windows en attente (non bloquant).
+ * Dépile et traite tous les événements système Windows en attente (non bloquant).
  * @param window Pointeur vers la fenêtre.
  * @return true si la fenêtre doit rester ouverte, false si la fermeture a été demandée.
  */
@@ -86,6 +66,60 @@ void drawPixel(MyWindow* window, int x, int y, uint32_t color);
  */
 void drawRect(MyWindow* window, int x, int y, int w, int h, uint32_t color);
 
+/* =========================================================================
+ * COULEURS DE BASE (Format 0x00RRGGBB)
+ * ========================================================================= */
+#define GT_BLACK     0x00000000
+#define GT_WHITE     0x00FFFFFF
+#define GT_RED       0x00F43F5E
+#define GT_GREEN     0x0022C55E
+#define GT_BLUE      0x003B82F6
+#define GT_YELLOW    0x00EAB308
+#define GT_DARKGRAY  0x000F172A
+
+/* =========================================================================
+ * GESTION DES ENTRÉES (Clavier & Souris)
+ * ========================================================================= */
+
+// Codes des boutons de la souris
+#define GT_MOUSE_BUTTON_LEFT   0
+#define GT_MOUSE_BUTTON_RIGHT  1
+#define GT_MOUSE_BUTTON_MIDDLE 2
+
+// Raccourcis pour les touches virtuelles Windows courants (VK_*)
+#define GT_KEY_SPACE     0x20
+#define GT_KEY_LEFT      0x25
+#define GT_KEY_UP        0x26
+#define GT_KEY_RIGHT     0x27
+#define GT_KEY_DOWN      0x28
+#define GT_KEY_A         'A'
+#define GT_KEY_D         'D'
+#define GT_KEY_S         'S'
+#define GT_KEY_W         'W'
+#define GT_KEY_ESCAPE    0x1B
+
+/**
+ * Vérifie si une touche du clavier est actuellement enfoncée.
+ * @param window Pointeur vers la fenêtre.
+ * @param keycode Code de la touche (ex: GT_KEY_SPACE ou 'A').
+ */
+bool isKeyDown(MyWindow* window, int keycode);
+
+/**
+ * Vérifie si un bouton de la souris est actuellement enfoncé.
+ * @param window Pointeur vers la fenêtre.
+ * @param button GT_MOUSE_BUTTON_LEFT, GT_MOUSE_BUTTON_RIGHT ou GT_MOUSE_BUTTON_MIDDLE.
+ */
+bool isMouseButtonDown(MyWindow* window, int button);
+
+/**
+ * Récupère la position actuelle du curseur relative à la surface cliente de la fenêtre.
+ * @param window Pointeur vers la fenêtre.
+ * @param out_x Pointeur de sortie pour X (peut être NULL).
+ * @param out_y Pointeur de sortie pour Y (peut être NULL).
+ */
+void getMousePos(MyWindow* window, int* out_x, int* out_y);
+
 
 /* =========================================================================
  * IMPLÉMENTATION NATIVE WIN32
@@ -95,17 +129,26 @@ void drawRect(MyWindow* window, int x, int y, int w, int h, uint32_t color);
 #include <windows.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 // Définition interne de la structure MyWindow
 struct MyWindow {
+    // --- BASE FENÊTRE ---
     HWND hwnd;              // Handle (identifiant unique) de la fenêtre fourni par l'OS
     HINSTANCE hInstance;    // Pointeur vers l'instance de l'exécutable en mémoire
     int width;              // Largeur de la zone cliente (zone d'affichage utile)
     int height;             // Hauteur de la zone cliente
     bool should_close;      // Drapeau indiquant si la fenêtre a reçu un ordre de fermeture
 
+    // --- DESSIN ---
     uint32_t* buffer;       // Tampon 1D de pixels en RAM (format ARGB 32-bit, taille = width * height)
-    BITMAPINFO bmi;         // Metadonnées décrivant la structure du buffer pour Win32 GDI
+    BITMAPINFO bmi;         // Métadonnées décrivant la structure du buffer pour Win32 GDI
+
+    // --- ÉTAT DES ENTRÉES ---
+    bool keys[256];         // État de 256 touches virtuelles Windows
+    bool mouse_buttons[3];  // 0: Gauche, 1: Droit, 2: Milieu
+    int mouse_x;            // Position X du curseur dans la fenêtre
+    int mouse_y;            // Position Y du curseur dans la fenêtre
 };
 
 /**
@@ -117,19 +160,76 @@ static LRESULT CALLBACK MyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     MyWindow* win = (MyWindow*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 
     switch (msg) {
+        // --- CLAVIER ---
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN:
+            if (win && wParam < 256) {
+                win->keys[wParam] = true;
+            }
+            break;
+
+        case WM_KEYUP:
+        case WM_SYSKEYUP:
+            if (win && wParam < 256) {
+                win->keys[wParam] = false;
+            }
+            break;
+
+        // --- SOURIS (Boutons) ---
+        case WM_LBUTTONDOWN:
+            if (win) {
+                win->mouse_buttons[GT_MOUSE_BUTTON_LEFT] = true;
+                SetCapture(hwnd); // Capture pour garder le contrôle hors fenêtre
+            }
+            break;
+        case WM_LBUTTONUP:
+            if (win) {
+                win->mouse_buttons[GT_MOUSE_BUTTON_LEFT] = false;
+                ReleaseCapture();
+            }
+            break;
+
+        case WM_RBUTTONDOWN:
+            if (win) win->mouse_buttons[GT_MOUSE_BUTTON_RIGHT] = true;
+            break;
+        case WM_RBUTTONUP:
+            if (win) win->mouse_buttons[GT_MOUSE_BUTTON_RIGHT] = false;
+            break;
+
+        case WM_MBUTTONDOWN:
+            if (win) win->mouse_buttons[GT_MOUSE_BUTTON_MIDDLE] = true;
+            break;
+        case WM_MBUTTONUP:
+            if (win) win->mouse_buttons[GT_MOUSE_BUTTON_MIDDLE] = false;
+            break;
+
+        // --- SOURIS (Mouvement) ---
+        case WM_MOUSEMOVE:
+            if (win) {
+                win->mouse_x = (int)(short)LOWORD(lParam);
+                win->mouse_y = (int)(short)HIWORD(lParam);
+            }
+            break;
+
+        // --- PERTE DU FOCUS (Réinitialisation des touches / boutons) ---
+        case WM_KILLFOCUS:
+            if (win) {
+                memset(win->keys, 0, sizeof(win->keys));
+                memset(win->mouse_buttons, 0, sizeof(win->mouse_buttons));
+            }
+            break;
+
+        // --- FERMETURE ---
         case WM_CLOSE:
-            // L'utilisateur a cliqué sur la croix ou fait Alt+F4
             if (win) win->should_close = true;
-            DestroyWindow(hwnd);
+            // Ne pas appeler DestroyWindow ici pour éviter une double destruction dans destroyWin
             break;
 
         case WM_DESTROY:
-            // La fenêtre est totalement détruite, on signale la fin de la boucle d'événements
             PostQuitMessage(0);
             break;
 
         default:
-            // Déléguer les centaines d'autres messages système à la procédure par défaut
             return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
     return 0;
@@ -137,7 +237,7 @@ static LRESULT CALLBACK MyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 
 MyWindow* createWin(const char* title, int width, int height) {
     // 1. Allocation de la structure englobante en RAM
-    MyWindow* win = (MyWindow*)malloc(sizeof(MyWindow));
+    MyWindow* win = (MyWindow*)calloc(1, sizeof(MyWindow));
     if (!win) {
         fprintf(stderr, "[LIBGT ERROR] Échec d'allocation mémoire pour MyWindow.\n");
         return NULL;
@@ -153,7 +253,7 @@ MyWindow* createWin(const char* title, int width, int height) {
     wc.lpfnWndProc   = MyWndProc;
     wc.hInstance     = win->hInstance;
     wc.lpszClassName = "LIBGTWindowClass";
-    wc.hCursor       = LoadCursor(NULL, IDC_ARROW); // Curseur pointeur standard
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
 
     if (!RegisterClassA(&wc)) {
         // Ignoré si la classe a déjà été enregistrée par un appel précédent
@@ -212,11 +312,13 @@ void destroyWin(MyWindow* window) {
     // Nettoyage Win32
     if (window->hwnd) {
         DestroyWindow(window->hwnd);
+        window->hwnd = NULL;
     }
 
-    // Libération de la mémoire RAM allocation
+    // Libération de la mémoire RAM
     if (window->buffer) {
         free(window->buffer);
+        window->buffer = NULL;
     }
 
     free(window);
@@ -231,8 +333,8 @@ bool eventsWin(MyWindow* window) {
         if (msg.message == WM_QUIT) {
             window->should_close = true;
         }
-        TranslateMessage(&msg); // Traduction des codes de touches clavier bruts en caractères ASCII
-        DispatchMessageA(&msg); // Envoie du message à notre MyWndProc
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
     }
 
     return !window->should_close;
@@ -241,21 +343,18 @@ bool eventsWin(MyWindow* window) {
 void updateWin(MyWindow* window) {
     if (!window || !window->hwnd || !window->buffer) return;
 
-    // Récupération du Device Context (contexte de dessin de la fenêtre)
     HDC hdc = GetDC(window->hwnd);
 
-    // Blitting (copie mémoire RAM vers VRAM/Écran)
     StretchDIBits(
         hdc,
-        0, 0, window->width, window->height, // Zone de destination dans la fenêtre
-        0, 0, window->width, window->height, // Zone source dans le buffer
+        0, 0, window->width, window->height,
+        0, 0, window->width, window->height,
         window->buffer,
         &window->bmi,
         DIB_RGB_COLORS,
         SRCCOPY
     );
 
-    // Libération impérative du Device Context pour éviter les fuites de ressources Win32
     ReleaseDC(window->hwnd, hdc);
 }
 
@@ -271,22 +370,47 @@ void clearWin(MyWindow* window, uint32_t color) {
 void drawPixel(MyWindow* window, int x, int y, uint32_t color) {
     if (!window || !window->buffer) return;
 
-    // CLIPPING: Évite d'écrire hors mémoire si (x,y) est en dehors de la surface cliente
     if (x < 0 || x >= window->width || y < 0 || y >= window->height) return;
 
-    // Conversion des coordonnées 2D (x, y) en un index 1D linéaire : index = (y * largeur) + x
     window->buffer[y * window->width + x] = color;
 }
 
+// Version optimisée de drawRect avec clipping global
 void drawRect(MyWindow* window, int x, int y, int w, int h, uint32_t color) {
-    if (!window || !window->buffer) return;
+    if (!window || !window->buffer || w <= 0 || h <= 0) return;
 
-    // Double boucle de remplissage ligne par ligne
-    for (int row = y; row < y + h; row++) {
-        for (int col = x; col < x + w; col++) {
-            drawPixel(window, col, row, color);
+    // Clipping unique aux bornes de la fenêtre
+    int x1 = (x < 0) ? 0 : x;
+    int y1 = (y < 0) ? 0 : y;
+    int x2 = (x + w > window->width) ? window->width : (x + w);
+    int y2 = (y + h > window->height) ? window->height : (y + h);
+
+    if (x1 >= x2 || y1 >= y2) return; // Hors écran
+
+    int row_stride = window->width;
+    for (int row = y1; row < y2; row++) {
+        uint32_t* row_ptr = &window->buffer[row * row_stride + x1];
+        int count = x2 - x1;
+        for (int col = 0; col < count; col++) {
+            row_ptr[col] = color;
         }
     }
+}
+
+bool isKeyDown(MyWindow* window, int keycode) {
+    if (!window || keycode < 0 || keycode >= 256) return false;
+    return window->keys[keycode];
+}
+
+bool isMouseButtonDown(MyWindow* window, int button) {
+    if (!window || button < 0 || button >= 3) return false;
+    return window->mouse_buttons[button];
+}
+
+void getMousePos(MyWindow* window, int* out_x, int* out_y) {
+    if (!window) return;
+    if (out_x) *out_x = window->mouse_x;
+    if (out_y) *out_y = window->mouse_y;
 }
 
 #endif // LIBGT_IMPLEMENTATION
