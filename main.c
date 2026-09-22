@@ -19,7 +19,7 @@ int main(void) {
         clearWin(win, 0x000F172A);
 
         // 2. Dessiner un rectangle rouge/rose (0x00F43F5E) qui se déplace
-        drawRect(win, rect_x, 200, 150, 100, 0x00F43F5E);
+        drawRect(win, rect_x, 200, 150, 100, GT_GREEN);
         
         // Fait défiler le rectangle vers la droite
         rect_x += 2;
