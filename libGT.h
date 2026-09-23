@@ -13,11 +13,14 @@
     typedef struct GtWindow GtWindow;
 
     // Fonctions de gestion du cycle de vie de la fenêtre
-    GtWindow* gtCreateWindow(const char* title, int width, int height);
-    void      gtDestroyWindow(GtWindow* window);
-    bool      gtEventsWindow(GtWindow* window);
-    void      gtUpdateWindow(GtWindow* window);
-    void      gtClearWindow(GtWindow* window, uint32_t color);
+        GtWindow* gtCreateWindow(const char* title, int width, int height);
+        void      gtDestroyWindow(GtWindow* window);
+        bool      gtEventsWindow(GtWindow* window);
+        void      gtUpdateWindow(GtWindow* window);
+        void      gtClearWindow(GtWindow* window, uint32_t color);
+        bool      gtShouldClose(GtWindow* window);
+        int       gtGetWidth(GtWindow* window);
+        int       gtGetHeight(GtWindow* window);
 
     // Fonctions de rendu graphique (primitives 2D)
     void gtDrawPixel(GtWindow* window, int x, int y, uint32_t color);
@@ -292,12 +295,37 @@
                 break;
 
             case WM_MOUSEMOVE:
-                if (win) {
-                    win->mouse_x = (int)(short)LOWORD(lParam);
-                    win->mouse_y = (int)(short)HIWORD(lParam);
-                }
-                break;
-            case WM_CANCELMODE:
+                            if (win) {
+                                win->mouse_x = (int)(short)LOWORD(lParam);
+                                win->mouse_y = (int)(short)HIWORD(lParam);
+                            }
+                            break;
+
+                        case WM_SIZE:
+                            if (win) {
+                                int new_width = LOWORD(lParam);
+                                int new_height = HIWORD(lParam);
+                                if (new_width > 0 && new_height > 0 &&
+                                    (new_width != win->width || new_height != win->height)) {
+                                    // Reallocate framebuffer
+                                    uint32_t* new_buffer = (uint32_t*)realloc(
+                                        win->buffer,
+                                        (size_t)new_width * (size_t)new_height * sizeof(uint32_t)
+                                    );
+                                    if (new_buffer) {
+                                        win->buffer = new_buffer;
+                                        win->width = new_width;
+                                        win->height = new_height;
+
+                                        // Update BITMAPINFO
+                                        win->bmi.bmiHeader.biWidth = new_width;
+                                        win->bmi.bmiHeader.biHeight = -new_height; // Top-down DIB
+                                    }
+                                }
+                            }
+                            break;
+
+                        case WM_CANCELMODE:
                 if (win) {
                     memset(
                         win->mouse_buttons,
@@ -356,22 +384,20 @@ case WM_CAPTURECHANGED:
         win->hInstance = GetModuleHandle(NULL);
 
         WNDCLASSA wc = {0};
-        wc.lpfnWndProc   = GtWndProc;
-        wc.hInstance     = win->hInstance;
-        wc.lpszClassName = "LIBGTWindowClass";
-        wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+                wc.lpfnWndProc   = GtWndProc;
+                wc.hInstance     = win->hInstance;
+                wc.lpszClassName = "LIBGTWindowClass";
+                wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
 
-        if (!RegisterClassA(&wc)) {
-            if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-                free(win);
-                return NULL;
-            }
-            } else {
-            registered_class = true;
-        }
-        if (registered_class) {
-            g_gtWindowClassRegistered = true;
-        }
+                if (!RegisterClassA(&wc)) {
+                    if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+                        free(win);
+                        return NULL;
+                    }
+                    // Class already exists, that's fine - we can use it
+                }
+                // Mark class as registered (either we just registered it or it already existed)
+                g_gtWindowClassRegistered = true;
 
         RECT rect = {0, 0, width, height};
         if (!AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE)) {
@@ -481,23 +507,16 @@ case WM_CAPTURECHANGED:
     }
 
     // Effacement de l'écran avec une couleur unie
-    void gtClearWindow(GtWindow* window, uint32_t color) {
-        if (!window || !window->buffer) return;
-        size_t total_pixels =
-        (size_t)window->width * (size_t)window->height;
+        void gtClearWindow(GtWindow* window, uint32_t color) {
+            if (!window || !window->buffer) return;
+            size_t total_pixels =
+            (size_t)window->width * (size_t)window->height;
 
-        if (color == 0) {
-            memset(
-                window->buffer,
-                0,
-        total_pixels * sizeof(uint32_t)
-        );
-        } else {
+            // Use loop for all colors for consistency (memset only works byte-wise for 0)
             for (size_t i = 0; i < total_pixels; i++) {
-            window->buffer[i] = color;
+                window->buffer[i] = color;
             }
         }
-    }
 
     /* -------------------------------------------------------------------------
     * PRIMITIVES PUBLIQUES DE DESSIN 2D
@@ -771,10 +790,25 @@ case WM_CAPTURECHANGED:
     }
 
     void gtGetMousePos(GtWindow* window, int* out_x, int* out_y) {
-        if (!window) return;
-        if (out_x) *out_x = window->mouse_x;
-        if (out_y) *out_y = window->mouse_y;
-    }
+            if (!window) return;
+            if (out_x) *out_x = window->mouse_x;
+            if (out_y) *out_y = window->mouse_y;
+        }
 
-    #endif // LIBGT_IMPLEMENTATION
+        bool gtShouldClose(GtWindow* window) {
+            if (!window) return true;
+            return window->should_close;
+        }
+
+        int gtGetWidth(GtWindow* window) {
+            if (!window) return 0;
+            return window->width;
+        }
+
+        int gtGetHeight(GtWindow* window) {
+            if (!window) return 0;
+            return window->height;
+        }
+
+        #endif // LIBGT_IMPLEMENTATION
     #endif // LIBGT_H
