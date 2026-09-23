@@ -221,15 +221,18 @@ static LRESULT CALLBACK MyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 
         // --- FERMETURE ---
         case WM_CLOSE:
+            // L'utilisateur a cliqué sur la croix ou fait Alt+F4
             if (win) win->should_close = true;
             // Ne pas appeler DestroyWindow ici pour éviter une double destruction dans destroyWin
             break;
 
         case WM_DESTROY:
+            // La fenêtre est totalement détruite, on signale la fin de la boucle d'événements
             PostQuitMessage(0);
             break;
 
         default:
+            // Déléguer les centaines d'autres messages système à la procédure par défaut
             return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
     return 0;
@@ -253,7 +256,7 @@ MyWindow* createWin(const char* title, int width, int height) {
     wc.lpfnWndProc   = MyWndProc;
     wc.hInstance     = win->hInstance;
     wc.lpszClassName = "LIBGTWindowClass";
-    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW); // Curseur pointeur standard
 
     if (!RegisterClassA(&wc)) {
         // Ignoré si la classe a déjà été enregistrée par un appel précédent
@@ -333,8 +336,8 @@ bool eventsWin(MyWindow* window) {
         if (msg.message == WM_QUIT) {
             window->should_close = true;
         }
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        TranslateMessage(&msg); // Traduction des codes de touches clavier bruts en caractères ASCII
+        DispatchMessageA(&msg); // Envoie du message à notre MyWndProc
     }
 
     return !window->should_close;
