@@ -463,9 +463,11 @@ void gtDrawRectLines(GtWindow* window, int x, int y, int w, int h, uint32_t colo
     int64_t xw = (int64_t)x + w - 1;
     int64_t yh = (int64_t)y + h - 1;
 
+    // Fix off-by-one : borne maximale ramenée à width - 1 / height - 1
     int x2 = (xw >= (int64_t)window->width) ? (window->width - 1) : (int)xw;
     int y2 = (yh >= (int64_t)window->height) ? (window->height - 1) : (int)yh;
 
+    // Fix double tracé : tests (h > 1) et (w > 1) pour les rectangles fins de 1px
     drawHLineClipped(window, y, x, x2, color);
     if (h > 1) drawHLineClipped(window, y2, x, x2, color);
     drawVLineClipped(window, x, y, y2, color);
