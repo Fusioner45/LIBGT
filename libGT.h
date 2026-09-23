@@ -4,7 +4,7 @@
     #include <stdbool.h>
     #include <stdint.h>
     #include <stddef.h>
-
+    
     /* =========================================================================
     * API PUBLIQUE (Déclarations)
     * ========================================================================= */
@@ -70,6 +70,8 @@
     #include <stdlib.h>
     #include <string.h>
 
+    static bool g_gtWindowClassRegistered = false;
+    
     // Définition interne de la structure de fenêtre
     struct GtWindow {
         HWND      hwnd;          // Identifiant unique de la fenêtre Win32
@@ -126,7 +128,7 @@
         while (1) {
             putPixelUnchecked(window, x1, y1, color);
             if (x1 == x2 && y1 == y2) break;
-            int e2 = 2 * err;
+            int64_t e2 = (int64_t)err * 2;
             if (e2 > -dy) {
                 err -= dy;
                 x1 += sx;
@@ -295,13 +297,35 @@
                     win->mouse_y = (int)(short)HIWORD(lParam);
                 }
                 break;
-
-            case WM_KILLFOCUS:
+            case WM_CANCELMODE:
                 if (win) {
-                    memset(win->keys, 0, sizeof(win->keys));
-                    memset(win->mouse_buttons, 0, sizeof(win->mouse_buttons));
+                    memset(
+                        win->mouse_buttons,
+                        0,
+                        sizeof(win->mouse_buttons)
+                    );
+
+                    if (GetCapture() == hwnd) {
+                        ReleaseCapture();
+                    }
                 }
                 break;
+
+case WM_CAPTURECHANGED:
+    if (win) {
+        win->mouse_buttons[GT_MOUSE_BUTTON_LEFT] = false;
+    }
+    break;
+            case WM_KILLFOCUS:
+            if (win) {
+                memset(win->keys, 0, sizeof(win->keys));
+                memset(win->mouse_buttons, 0, sizeof(win->mouse_buttons));
+
+                if (GetCapture() == hwnd) {
+                    ReleaseCapture();
+                }
+            }
+            break;
 
             case WM_CLOSE:
                 if (win) win->should_close = true;
@@ -319,6 +343,7 @@
 
     // Instanciation de la fenêtre et allocation mémoire
     GtWindow* gtCreateWindow(const char* title, int width, int height) {
+        bool registered_class = false;
         if (width <= 0 || height <= 0) return NULL;
         if ((size_t)width > SIZE_MAX / (size_t)height / sizeof(uint32_t)) return NULL;
 
@@ -341,10 +366,20 @@
                 free(win);
                 return NULL;
             }
+            } else {
+            registered_class = true;
+        }
+        if (registered_class) {
+            g_gtWindowClassRegistered = true;
         }
 
         RECT rect = {0, 0, width, height};
         if (!AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE)) {
+            if (registered_class) {
+                UnregisterClassA("LIBGTWindowClass", win->hInstance);
+                g_gtWindowClassRegistered = false;
+            }
+
             free(win);
             return NULL;
         }
@@ -358,6 +393,11 @@
         );
 
         if (!win->hwnd) {
+            if (registered_class) {
+                UnregisterClassA("LIBGTWindowClass", win->hInstance);
+                g_gtWindowClassRegistered = false;
+            }
+
             free(win);
             return NULL;
         }
@@ -369,6 +409,12 @@
         );
         if (!win->buffer) {
             DestroyWindow(win->hwnd);
+
+            if (registered_class) {
+                UnregisterClassA("LIBGTWindowClass", win->hInstance);
+                g_gtWindowClassRegistered = false;
+            }
+
             free(win);
             return NULL;
         }
@@ -387,10 +433,24 @@
 
     // Destruction de la fenêtre et libération mémoire
     void gtDestroyWindow(GtWindow* window) {
-        if (!window) return;
-        if (window->hwnd) DestroyWindow(window->hwnd);
-        if (window->buffer) free(window->buffer);
-        free(window);
+    if (!window) return;
+
+    HINSTANCE hInstance = window->hInstance;
+
+    if (window->hwnd) {
+        DestroyWindow(window->hwnd);
+    }
+
+    if (window->buffer) {
+        free(window->buffer);
+    }
+
+    free(window);
+
+    if (g_gtWindowClassRegistered) {
+        UnregisterClassA("LIBGTWindowClass", hInstance);
+        g_gtWindowClassRegistered = false;
+    }
     }
 
     // Traitement de la file de messages Windows
@@ -423,9 +483,19 @@
     // Effacement de l'écran avec une couleur unie
     void gtClearWindow(GtWindow* window, uint32_t color) {
         if (!window || !window->buffer) return;
-        size_t total_pixels = (size_t)window->width * (size_t)window->height;
-        for (size_t i = 0; i < total_pixels; i++) {
+        size_t total_pixels =
+        (size_t)window->width * (size_t)window->height;
+
+        if (color == 0) {
+            memset(
+                window->buffer,
+                0,
+        total_pixels * sizeof(uint32_t)
+        );
+        } else {
+            for (size_t i = 0; i < total_pixels; i++) {
             window->buffer[i] = color;
+            }
         }
     }
 
@@ -451,13 +521,24 @@
         if (x1 >= x2 || y1 >= y2) return;
 
         size_t stride = (size_t)window->width;
+        int count = x2 - x1;
+
         for (int row = y1; row < y2; row++) {
-            uint32_t* row_ptr = &window->buffer[(size_t)row * stride + (size_t)x1];
-            int count = x2 - x1;
+        uint32_t* row_ptr =
+            &window->buffer[(size_t)row * stride + (size_t)x1];
+
+        if (color == 0) {
+            memset(
+                row_ptr,
+                0,
+                (size_t)count * sizeof(uint32_t)
+            );
+        } else {
             for (int col = 0; col < count; col++) {
                 row_ptr[col] = color;
             }
         }
+    }
     }
 
     void gtDrawRectLines(GtWindow* window, int x, int y, int w, int h, uint32_t color) {
@@ -477,7 +558,7 @@
         /* Bords horizontaux : ils dessinent déjà les coins. */
         drawHLineClipped(window, y, x, x2, color);
 
-        if (h > 1) {
+        if (y2 != y) {
             drawHLineClipped(window, y2, x, x2, color);
         }
 
@@ -492,7 +573,7 @@
         if (vertical_y1 <= vertical_y2) {
             drawVLineClipped(window, x, vertical_y1, vertical_y2, color);
 
-            if (w > 1) {
+            if (x2 != x) {
                 drawVLineClipped(window, x2, vertical_y1, vertical_y2, color);
             }
         }
