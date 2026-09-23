@@ -9,14 +9,17 @@
  * API PUBLIQUE (Déclarations)
  * ========================================================================= */
 
+// Structure opaque représentant la fenêtre et le framebuffer
 typedef struct GtWindow GtWindow;
 
+// Fonctions de gestion du cycle de vie de la fenêtre
 GtWindow* gtCreateWindow(const char* title, int width, int height);
 void gtDestroyWindow(GtWindow* window);
 bool gtEventsWindow(GtWindow* window);
 void gtUpdateWindow(GtWindow* window);
 void gtClearWindow(GtWindow* window, uint32_t color);
 
+// Fonctions de rendu graphique (primitives 2D)
 void gtDrawPixel(GtWindow* window, int x, int y, uint32_t color);
 void gtDrawRect(GtWindow* window, int x, int y, int w, int h, uint32_t color);
 void gtDrawRectLines(GtWindow* window, int x, int y, int w, int h, uint32_t color);
@@ -25,7 +28,7 @@ void gtDrawCircleLines(GtWindow* window, int cx, int cy, int radius, uint32_t co
 void gtDrawCircle(GtWindow* window, int cx, int cy, int radius, uint32_t color);
 
 /* =========================================================================
- * COULEURS DE BASE (Format 0x00RRGGBB)
+ * COULEURS DE BASE (Format HEXADÉCIMAL 0x00RRGGBB)
  * ========================================================================= */
 #define GT_BLACK     0x00000000
 #define GT_WHITE     0x00FFFFFF
@@ -42,6 +45,7 @@ void gtDrawCircle(GtWindow* window, int cx, int cy, int radius, uint32_t color);
 #define GT_MOUSE_BUTTON_RIGHT  1
 #define GT_MOUSE_BUTTON_MIDDLE 2
 
+// Virtual-Key codes Windows (VK_*)
 #define GT_KEY_SPACE     0x20
 #define GT_KEY_LEFT      0x25
 #define GT_KEY_UP        0x26
@@ -66,29 +70,34 @@ void gtGetMousePos(GtWindow* window, int* out_x, int* out_y);
 #include <stdlib.h>
 #include <string.h>
 
+// Définition interne de la structure de fenêtre
 struct GtWindow {
-    HWND hwnd;
-    HINSTANCE hInstance;
-    int width;
-    int height;
-    bool should_close;
+    HWND hwnd;              // Identifiant unique de la fenêtre sous Windows
+    HINSTANCE hInstance;    // Handle de l'instance de l'exécutable
+    int width;              // Largeur utile de la zone de dessin (surface cliente)
+    int height;             // Hauteur utile de la zone de dessin
+    bool should_close;      // Indicateur de demande de fermeture de la fenêtre
 
-    uint32_t* buffer;
-    BITMAPINFO bmi;
+    uint32_t* buffer;       // Framebuffer 1D en RAM (index = y * width + x)
+    BITMAPINFO bmi;         // Description du format de l'image pour Win32 GDI
 
-    bool keys[256];
-    bool mouse_buttons[3];
-    int mouse_x;
-    int mouse_y;
+    bool keys[256];         // État de pression de toutes les touches virtuelles
+    bool mouse_buttons[3];  // État des 3 boutons de la souris
+    int mouse_x;            // Position X actuelle de la souris (relative à la fenêtre)
+    int mouse_y;            // Position Y actuelle de la souris
 };
 
 /* -------------------------------------------------------------------------
- * RASTERISATION BAS NIVEAU (Directe et sans vérification)
+ * RASTERISATION BAS NIVEAU (Directe dans le buffer RAM, sans aucun test)
+ * Attention : l'appelant doit garantir que les coordonnées sont dans l'écran !
  * ------------------------------------------------------------------------- */
+
+// Écrit un pixel unique directement dans le buffer
 static inline void putPixelUnchecked(GtWindow* window, int x, int y, uint32_t color) {
     window->buffer[(size_t)y * (size_t)window->width + (size_t)x] = color;
 }
 
+// Trace une ligne horizontale continue en mémoire (rapide)
 static inline void rasterizeHLineUnchecked(GtWindow* window, int y, int x1, int x2, uint32_t color) {
     size_t row_start = (size_t)y * (size_t)window->width;
     for (int x = x1; x <= x2; x++) {
@@ -96,6 +105,7 @@ static inline void rasterizeHLineUnchecked(GtWindow* window, int y, int x1, int 
     }
 }
 
+// Trace une ligne verticale continue (déplacement par 'stride' = largeur d'une ligne)
 static inline void rasterizeVLineUnchecked(GtWindow* window, int x, int y1, int y2, uint32_t color) {
     size_t stride = (size_t)window->width;
     size_t index = (size_t)y1 * stride + (size_t)x;
@@ -105,6 +115,7 @@ static inline void rasterizeVLineUnchecked(GtWindow* window, int x, int y1, int 
     }
 }
 
+// Algorithme de ligne de Bresenham (calcul uniquement sur entiers)
 static inline void rasterizeBresenhamUnchecked(GtWindow* window, int x1, int y1, int x2, int y2, uint32_t color) {
     int dx = abs(x2 - x1);
     int dy = abs(y2 - y1);
@@ -128,14 +139,17 @@ static inline void rasterizeBresenhamUnchecked(GtWindow* window, int x1, int y1,
 }
 
 /* -------------------------------------------------------------------------
- * CLIPPING DE SEGMENTS (Algorithme Cohen-Sutherland sécurisé en int64_t)
+ * CLIPPING DE SEGMENTS (Algorithme Cohen-Sutherland)
+ * Découpe un segment pour qu'il rentre exactement dans le rectangle [0, w-1] x [0, h-1].
+ * Utilise des int64_t et des vérifications de zéro pour éviter tout overflow et division par zéro.
  * ------------------------------------------------------------------------- */
-#define CS_INSIDE 0
-#define CS_LEFT   1
-#define CS_RIGHT  2
-#define CS_BOTTOM 4
-#define CS_TOP    8
+#define CS_INSIDE 0 // 0000 : Le point est dans l'écran
+#define CS_LEFT   1 // 0001 : À gauche de l'écran
+#define CS_RIGHT  2 // 0010 : À droite de l'écran
+#define CS_BOTTOM 4 // 0100 : En dessous (selon repère Win32)
+#define CS_TOP    8 // 1000 : Au-dessus
 
+// Calcule le masque binaire (OutCode) représentant la position d'un point par rapport à l'écran
 static int computeCSCode(int x, int y, int w, int h) {
     int code = CS_INSIDE;
     if (x < 0)       code |= CS_LEFT;
@@ -145,6 +159,7 @@ static int computeCSCode(int x, int y, int w, int h) {
     return code;
 }
 
+// Recadre les pointeurs (x1,y1)-(x2,y2). Renvoie false si la ligne est totalement invisible.
 static bool clipLineSegment(int* x1, int* y1, int* x2, int* y2, int w, int h) {
     int code1 = computeCSCode(*x1, *y1, w, h);
     int code2 = computeCSCode(*x2, *y2, w, h);
@@ -154,26 +169,31 @@ static bool clipLineSegment(int* x1, int* y1, int* x2, int* y2, int w, int h) {
         if ((code1 | code2) == 0) {
             accept = true;
             break;
-        } else if (code1 & code2) {
+        } 
+        else if (code1 & code2) {
             break;
-        } else {
+        } 
+        else {
             int x = 0, y = 0;
             int code_out = code1 ? code1 : code2;
 
             int64_t x1_64 = *x1, y1_64 = *y1;
             int64_t x2_64 = *x2, y2_64 = *y2;
 
+            int64_t dx = x2_64 - x1_64;
+            int64_t dy = y2_64 - y1_64;
+
             if (code_out & CS_TOP) {
-                x = (int)(x1_64 + (x2_64 - x1_64) * ((int64_t)h - 1 - y1_64) / (y2_64 - y1_64));
+                x = (dy != 0) ? (int)(x1_64 + dx * ((int64_t)h - 1 - y1_64) / dy) : (int)x1_64;
                 y = h - 1;
             } else if (code_out & CS_BOTTOM) {
-                x = (int)(x1_64 + (x2_64 - x1_64) * (0 - y1_64) / (y2_64 - y1_64));
+                x = (dy != 0) ? (int)(x1_64 + dx * (0 - y1_64) / dy) : (int)x1_64;
                 y = 0;
             } else if (code_out & CS_RIGHT) {
-                y = (int)(y1_64 + (y2_64 - y1_64) * ((int64_t)w - 1 - x1_64) / (x2_64 - x1_64));
+                y = (dx != 0) ? (int)(y1_64 + dy * ((int64_t)w - 1 - x1_64) / dx) : (int)y1_64;
                 x = w - 1;
             } else if (code_out & CS_LEFT) {
-                y = (int)(y1_64 + (y2_64 - y1_64) * (0 - x1_64) / (x2_64 - x1_64));
+                y = (dx != 0) ? (int)(y1_64 + dy * (0 - x1_64) / dx) : (int)y1_64;
                 x = 0;
             }
 
@@ -194,12 +214,15 @@ static bool clipLineSegment(int* x1, int* y1, int* x2, int* y2, int w, int h) {
 /* -------------------------------------------------------------------------
  * HELPERS CANONIQUES ET CLIPPING SÉCURISÉS (int64_t)
  * ------------------------------------------------------------------------- */
+
+// Écrit un pixel après vérification sécurisée des limites (mode 64 bits)
 static inline void drawPixelClipped64(GtWindow* window, int64_t x, int64_t y, uint32_t color) {
     if (!window || !window->buffer) return;
     if (x < 0 || x >= window->width || y < 0 || y >= window->height) return;
     putPixelUnchecked(window, (int)x, (int)y, color);
 }
 
+// Restreint un segment horizontal dans les bornes de la fenêtre avant rendu
 static void drawHLineClipped(GtWindow* window, int64_t y, int64_t x1, int64_t x2, uint32_t color) {
     if (y < 0 || y >= window->height) return;
     if (x1 > x2) { int64_t tmp = x1; x1 = x2; x2 = tmp; }
@@ -211,6 +234,7 @@ static void drawHLineClipped(GtWindow* window, int64_t y, int64_t x1, int64_t x2
     rasterizeHLineUnchecked(window, (int)y, clipped_x1, clipped_x2, color);
 }
 
+// Restreint un segment vertical dans les bornes de la fenêtre avant rendu
 static void drawVLineClipped(GtWindow* window, int64_t x, int64_t y1, int64_t y2, uint32_t color) {
     if (x < 0 || x >= window->width) return;
     if (y1 > y2) { int64_t tmp = y1; y1 = y2; y2 = tmp; }
@@ -224,6 +248,7 @@ static void drawVLineClipped(GtWindow* window, int64_t x, int64_t y1, int64_t y2
 
 /* -------------------------------------------------------------------------
  * GESTION FENÊTRE & WIN32 WNDPROC
+ * Procédure de rappel (Callback) appelée par Windows dès qu'un événement survient.
  * ------------------------------------------------------------------------- */
 static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     GtWindow* win = (GtWindow*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
@@ -294,6 +319,7 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     return 0;
 }
 
+// Création globale de la fenêtre et initialisation des tampons
 GtWindow* gtCreateWindow(const char* title, int width, int height) {
     if (width <= 0 || height <= 0) return NULL;
     if ((size_t)width > SIZE_MAX / (size_t)height / sizeof(uint32_t)) return NULL;
@@ -387,7 +413,7 @@ void gtUpdateWindow(GtWindow* window) {
     );
 
     if (lines_copied == 0 || lines_copied == (int)GDI_ERROR) {
-        // Traitement optionnel de l'erreur
+        // Traitement d'erreur optionnel
     }
 
     ReleaseDC(window->hwnd, hdc);
@@ -402,7 +428,7 @@ void gtClearWindow(GtWindow* window, uint32_t color) {
 }
 
 /* -------------------------------------------------------------------------
- * PRIMITIVES PUBLIQUES (Pipeline : Validation -> Clipping -> Fast)
+ * PRIMITIVES PUBLIQUES (Pipeline : Validation -> Clipping -> Rendu Rapide)
  * ------------------------------------------------------------------------- */
 
 void gtDrawPixel(GtWindow* window, int x, int y, uint32_t color) {
