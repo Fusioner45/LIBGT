@@ -441,6 +441,16 @@ static int computeCSCode(int x, int y, int w, int h) {
 // Modifie les coordonnées sur place via pointeurs
 // Retourne true si une partie du segment est visible, false si totalement hors champ
 static bool clipLineSegment(int* x1, int* y1, int* x2, int* y2, int w, int h) {
+    // Protection contre overflow int64_t dans les calculs d'interpolation
+    // Rejeter les coordonnées extrêmes (> 1M pixels) qui causeraient dx*h > 2^63
+    const int64_t MAX_COORD = 1000000;
+    int64_t x1_64 = *x1, y1_64 = *y1;
+    int64_t x2_64 = *x2, y2_64 = *y2;
+    if (llabs(x1_64) > MAX_COORD || llabs(y1_64) > MAX_COORD ||
+        llabs(x2_64) > MAX_COORD || llabs(y2_64) > MAX_COORD) {
+        return false;  // Coordonnées hors limites raisonnables
+    }
+
     int code1 = computeCSCode(*x1, *y1, w, h);
     int code2 = computeCSCode(*x2, *y2, w, h);
     bool accept = false;
@@ -458,8 +468,6 @@ static bool clipLineSegment(int* x1, int* y1, int* x2, int* y2, int w, int h) {
             int code_out = code1 ? code1 : code2;  // Prend un point hors champ
 
             // Interpolation linéaire pour trouver intersection avec le bord
-            int64_t x1_64 = *x1, y1_64 = *y1;
-            int64_t x2_64 = *x2, y2_64 = *y2;
             int64_t dx = x2_64 - x1_64;
             int64_t dy = y2_64 - y1_64;
 
@@ -611,19 +619,28 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             break;
 
     // ===== REDIMENSIONNEMENT =====
-    case WM_SIZE:
-        if (win) {
-            int new_width = LOWORD(lParam);   // Nouvelle largeur zone cliente
-            int new_height = HIWORD(lParam);  // Nouvelle hauteur zone cliente
-            // Realloue seulement si taille réellement changée et valide
-            if (new_width > 0 && new_height > 0 &&
-                (new_width != win->width || new_height != win->height)) {
-                // Reallocate framebuffer (conserve le contenu si possible via realloc)
-                uint32_t* new_buffer = (uint32_t*)realloc(
-                    win->buffer,
-                    (size_t)new_width * (size_t)new_height * sizeof(uint32_t)
-                );
-                if (new_buffer) {
+        case WM_SIZE:
+            if (win) {
+                int new_width = LOWORD(lParam);   // Nouvelle largeur zone cliente
+                int new_height = HIWORD(lParam);  // Nouvelle hauteur zone cliente
+
+                // Ignorer minimisation (0x0) — on garde l'ancien buffer
+                if (new_width <= 0 || new_height <= 0) {
+                    win->mouse_tracking = false;  // Tracking invalide après minimisation
+                    break;
+                }
+
+                // Realloue seulement si taille réellement changée
+                if (new_width != win->width || new_height != win->height) {
+                    // Protection overflow taille
+                    if ((size_t)new_width > SIZE_MAX / (size_t)new_height / sizeof(uint32_t)) break;
+
+                    uint32_t* new_buffer = (uint32_t*)realloc(
+                        win->buffer,
+                        (size_t)new_width * (size_t)new_height * sizeof(uint32_t)
+                    );
+                    if (!new_buffer) break;  // Échec realloc : on garde ancien buffer + dimensions
+
                     win->buffer = new_buffer;
                     win->width = new_width;
                     win->height = new_height;
@@ -631,10 +648,16 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                     // Met à jour BITMAPINFO pour StretchDIBits (top-down DIB = biHeight négatif)
                     win->bmi.bmiHeader.biWidth = new_width;
                     win->bmi.bmiHeader.biHeight = -new_height;
+
+                    // Clear immédiat pour éviter l'effet "cisaillé" (ancien stride vs nouveau stride)
+                    size_t total = (size_t)new_width * new_height;
+                    for (size_t i = 0; i < total; i++) win->buffer[i] = 0;
                 }
+
+                // Tracking souris invalide après resize (Windows l'annule)
+                win->mouse_tracking = false;
             }
-        }
-        break;
+            break;
 
     // ===== PERTE DE FOCUS / CAPTURE =====
         case WM_CANCELMODE:   // Annulation mode (ex: menu ouvert, perte capture)
@@ -1135,13 +1158,13 @@ void gtBeginFrame(void) {
 * IMPLÉMENTATION : RENDERER ABSTRACTION (Backend GDI)
 * -------------------------------------------------------------------------
 * Structure interne du renderer (opaque pour l'utilisateur).
-* Contient le backend-specific data (HDC pour GDI, champs réservés pour D2D).
+* Contient le backend-specific data (champs réservés pour D2D).
+* Note: HDC n'est PAS stocké — obtenu via GetDC() à chaque frame dans gtRendererEnd
+*       pour éviter invalidation après WM_SIZE, changement DPI, veille, etc.
 * ------------------------------------------------------------------------- */
 struct GtRenderer {
     GtWindow* window;          // Fenêtre cible
     GtRendererType type;       // Type de backend (GDI ou D2D)
-    // GDI-specific
-    HDC hdc;                   // Device Context pour blitting final (StretchDIBits)
     // D2D-specific (réservé pour implémentation future)
     void* d2d_factory;         // ID2D1Factory*
     void* d2d_render_target;   // ID2D1HwndRenderTarget*
@@ -1159,16 +1182,11 @@ GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type) {
     renderer->window = window;
     renderer->type = type;
 
-    if (type == GT_RENDERER_GDI) {
-        // GDI : récupère le Device Context de la fenêtre
-        renderer->hdc = GetDC(window->hwnd);
-        if (!renderer->hdc) { free(renderer); return NULL; }
-    } else {
+    if (type == GT_RENDERER_D2D) {
         // D2D non implémenté : fallback silencieux vers GDI
         renderer->type = GT_RENDERER_GDI;
-        renderer->hdc = GetDC(window->hwnd);
-        if (!renderer->hdc) { free(renderer); return NULL; }
     }
+    // Pas de GetDC() ici — HDC obtenu à chaque frame dans gtRendererEnd
 
     return renderer;
 }
@@ -1176,11 +1194,7 @@ GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type) {
 // Détruit le renderer et libère ses ressources
 void gtDestroyRenderer(GtRenderer* renderer) {
     if (!renderer) return;
-
-    // Libère le Device Context GDI (doit correspondre à GetDC)
-    if (renderer->hdc && renderer->window && renderer->window->hwnd) {
-        ReleaseDC(renderer->window->hwnd, renderer->hdc);
-    }
+    // Pas de ReleaseDC() — HDC n'est pas stocké
     free(renderer);
 }
 
@@ -1192,19 +1206,13 @@ void gtRendererBegin(GtRenderer* renderer) {
 }
 
 // Fin de frame : présente le résultat à l'écran
-// GDI : StretchDIBits (blit framebuffer CPU -> fenêtre)
+// GDI : appelle gtUpdateWindow (GetDC/StretchDIBits/ReleaseDC à chaque frame)
 // D2D futur : EndDraw() + Present()
 void gtRendererEnd(GtRenderer* renderer) {
     if (!renderer || !renderer->window) return;
 
     if (renderer->type == GT_RENDERER_GDI) {
-        // Blit le framebuffer vers l'écran
-        StretchDIBits(
-            renderer->hdc,
-            0, 0, renderer->window->width, renderer->window->height,  // Dest
-            0, 0, renderer->window->width, renderer->window->height,  // Src
-            renderer->window->buffer, &renderer->window->bmi, DIB_RGB_COLORS, SRCCOPY
-        );
+        gtUpdateWindow(renderer->window);  // Unique point de blit (HDC frais à chaque appel)
     }
     // Pour D2D : EndDraw() + Present()
 }
