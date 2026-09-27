@@ -719,10 +719,11 @@ typedef struct GtBatchVertex {
     float x, y;           // Position écran (après transform)
     float u, v;           // UV (0-1 pour images, inutilisé pour primitives)
     uint32_t color;       // Couleur ARGB
-    float radius;         // Rayon pour cercles, 0 sinon
+    float radius;         // Rayon pour cercles, échelle pour texte, 0 sinon
     int image_id;         // Index dans le tableau d'images du batch (-1 = pas d'image)
     uint8_t prim_type;    // GtBatchPrimitiveType
-    uint8_t pad[3];       // Padding pour alignement 32 bytes
+    uint8_t glyph;        // Code ASCII (32-126) pour GT_BATCH_TEXT, 0 sinon
+    uint8_t pad[2];       // Padding pour alignement 32 bytes
 } GtBatchVertex;
 
 // Configuration du batch renderer
@@ -842,9 +843,11 @@ typedef struct GtInputBinding {
 } GtInputBinding;
 
 // Une action = nom + liste de bindings (OU logique : un seul suffit pour activer)
+// Le nom est détenu par la bibliothèque (copie interne), voir la convention
+// d'ownership documentée après GtPlayerProfile.
 #define GT_MAX_BINDINGS_PER_ACTION 8
 typedef struct {
-    const char* name;                    // "move_left", "jump", etc.
+    const char* name;                    // "move_left", "jump", etc. (copie possédée)
     GtInputBinding bindings[GT_MAX_BINDINGS_PER_ACTION];
     int binding_count;
     bool is_pressed;                     // État calculé cette frame
@@ -856,7 +859,7 @@ typedef struct {
 // Map d'actions (contexte : gameplay, menu, etc.)
 #define GT_MAX_ACTIONS_PER_MAP 64
 typedef struct {
-    const char* name;                    // "gameplay", "menu", "debug"
+    const char* name;                    // "gameplay", "menu", "debug" (copie possédée)
     GtAction actions[GT_MAX_ACTIONS_PER_MAP];
     int action_count;
     bool enabled;
@@ -871,17 +874,23 @@ typedef struct {
     int map_count;
     int active_map_stack[GT_MAX_MAPS_PER_PROFILE];
     int active_map_count;
-    
+
     // Gamepad settings
     float stick_deadzone;                // 0.15f défaut (radial deadzone)
     float trigger_threshold;             // 0.1f défaut
     float vibration_strength;            // 1.0f défaut
     bool gamepad_connected;
-    
+
     // Sensibilité souris (pour FPS etc.)
     float mouse_sensitivity;
     bool invert_y;
 } GtPlayerProfile;
+
+// Convention d'ownership des noms : la bibliothèque COPIE toujours les noms
+// (gtInputCreateMap, gtInputAddAction, gtInputLoadProfile). Les chaînes
+// passées par l'appelant peuvent donc être temporaires. En contrepartie,
+// un profil contenant des maps doit être libéré via gtInputDestroyProfile
+// (ou gtInputDestroy pour les profils possédés par le système).
 
 // Système d'input global (opaque, implémentation dans section LIBGT_IMPLEMENTATION)
 typedef struct GtInputSystem GtInputSystem;
@@ -900,11 +909,13 @@ void           gtInputUpdate(GtInputSystem* input, GtWindow* window, float dt);
 // Profils joueurs
 GtPlayerProfile* gtInputGetProfile(GtInputSystem* input, int player_index);
 void             gtInputSetProfile(GtInputSystem* input, int player_index, const GtPlayerProfile* profile);
+// Libère les noms dupliqués d'un profil possédé par l'appelant (après gtInputLoadProfile)
+void             gtInputDestroyProfile(GtPlayerProfile* profile);
 
 // Action Maps
-GtActionMap*     gtInputCreateMap(const char* name);
+GtActionMap*     gtInputCreateMap(const char* name);   // le nom est copié en interne
 void             gtInputDestroyMap(GtActionMap* map);
-void             gtInputAddAction(GtActionMap* map, const char* action_name);
+void             gtInputAddAction(GtActionMap* map, const char* action_name); // idem : copié
 void             gtInputBindKey(GtActionMap* map, const char* action, uint16_t vk);
 void             gtInputBindMouseBtn(GtActionMap* map, const char* action, uint8_t btn);
 void             gtInputBindGamepadBtn(GtActionMap* map, const char* action, int player, uint16_t btn);
@@ -2961,11 +2972,10 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
                            int x, int y, int w, int h,
                            float rot, GtVec2 origin,
                            bool flip_x, bool flip_y, GtColor tint) {
-    /* GDI renderer actuel : rotation/origine/flip ne sont pas encore rasterisés. */
+    /* GDI renderer actuel : rotation/origine ne sont pas encore rasterisés.
+     * flip_x/flip_y sont supportés (miroir du sampling source). */
     (void)rot;
     (void)origin;
-    (void)flip_x;
-    (void)flip_y;
 
     if (!renderer || !renderer->window || !image || w <= 0 || h <= 0) return;
 
@@ -3026,6 +3036,7 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
         int src_y = (int)(src_frac_y * (float)img_h);
         if (src_y < 0) src_y = 0;
         if (src_y >= img_h) src_y = img_h - 1;
+        if (flip_y) src_y = img_h - 1 - src_y; // miroir vertical exact
 
         uint32_t* dst_row =
             &win->buffer[(size_t)dst_y * (size_t)win->width];
@@ -3036,6 +3047,7 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
             int src_x = (int)(src_frac_x * (float)img_w);
             if (src_x < 0) src_x = 0;
             if (src_x >= img_w) src_x = img_w - 1;
+            if (flip_x) src_x = img_w - 1 - src_x; // miroir horizontal exact
 
             uint32_t src =
                 img_pixels[(size_t)src_y * (size_t)img_w + (size_t)src_x];
@@ -3092,6 +3104,16 @@ void gtRendererDrawImageTransformed(GtRenderer* renderer,
 
 /* =========================================================================
 * IMPLÉMENTATION : BATCH RENDERING (2.1)
+* =========================================================================
+* Décision d'architecture (actée) : ce "batch renderer" est un command
+* buffer CPU rejoué au flush — le backend GDI ne bénéficie d'aucun
+* batching GPU réel. GtBatchVertex (champs x/y, u/v, color, radius, image_id,
+* prim_type, glyph) est le contrat à préserver : un futur backend Direct2D
+* pourra consommer ce même buffer nativement (rects/quads, ellipses,
+* glyphs) et obtenir là le vrai gain de perf. Le CPU ne pré-tesselle plus
+* (1 vertex par cercle, quads seulement pour rects/lignes/texte) ;
+* à réévaluer au moment de brancher D2D (tri par image, fusion du flush
+* avec l'API directe).
 * ========================================================================= */
 
 #define GT_BATCH_MAX_TRANSFORM_STACK 32
@@ -3233,37 +3255,42 @@ static void gtBatchAddVertex(GtBatchRenderer* batch, GtBatchVertex v) {
 static void gtBatchEmitRect(GtBatchRenderer* batch, float x, float y, float w, float h, GtColor color, int image_id, float u0, float v0, float u1, float v1) {
     GtBatchVertex v[6];
     // Triangle 1: (x,y) (x+w,y) (x,y+h)
-    v[0] = (GtBatchVertex){ x, y, u0, v0, color, 0, image_id, GT_BATCH_RECT, {0} };
-    v[1] = (GtBatchVertex){ x + w, y, u1, v0, color, 0, image_id, GT_BATCH_RECT, {0} };
-    v[2] = (GtBatchVertex){ x, y + h, u0, v1, color, 0, image_id, GT_BATCH_RECT, {0} };
+    v[0] = (GtBatchVertex){ x, y, u0, v0, color, 0, image_id, GT_BATCH_RECT, 0, {0} };
+    v[1] = (GtBatchVertex){ x + w, y, u1, v0, color, 0, image_id, GT_BATCH_RECT, 0, {0} };
+    v[2] = (GtBatchVertex){ x, y + h, u0, v1, color, 0, image_id, GT_BATCH_RECT, 0, {0} };
     // Triangle 2: (x+w,y) (x+w,y+h) (x,y+h)
-    v[3] = (GtBatchVertex){ x + w, y, u1, v0, color, 0, image_id, GT_BATCH_RECT, {0} };
-    v[4] = (GtBatchVertex){ x + w, y + h, u1, v1, color, 0, image_id, GT_BATCH_RECT, {0} };
-    v[5] = (GtBatchVertex){ x, y + h, u0, v1, color, 0, image_id, GT_BATCH_RECT, {0} };
+    v[3] = (GtBatchVertex){ x + w, y, u1, v0, color, 0, image_id, GT_BATCH_RECT, 0, {0} };
+    v[4] = (GtBatchVertex){ x + w, y + h, u1, v1, color, 0, image_id, GT_BATCH_RECT, 0, {0} };
+    v[5] = (GtBatchVertex){ x, y + h, u0, v1, color, 0, image_id, GT_BATCH_RECT, 0, {0} };
     
     gtBatchEnsureCapacity(batch, 6);
     for (int i = 0; i < 6; i++) gtBatchAddVertex(batch, v[i]);
 }
 
-// Rasterise un cercle en vertices (triangle fan)
-static void gtBatchEmitCircle(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color, int segments) {
-    if (segments < 3) segments = 16;
-    if (segments > 64) segments = 64;
+// Émet un cercle : un seul vertex (centre) portant le rayon.
+// Le flush GDI n'utilise que centre/rayon/couleur, et un backend GPU
+// (Direct2D) dessinerait une ellipse native : pas de pré-tessellation
+// en triangle fan, qui de plus rendait ambigüe la frontière entre deux
+// cercles consécutifs au flush.
+static void gtBatchEmitCircle(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color) {
+    GtBatchVertex v = { cx, cy, 0, 0, color, radius, -1, GT_BATCH_CIRCLE, 0, {0} };
+    gtBatchEnsureCapacity(batch, 1);
+    gtBatchAddVertex(batch, v);
+}
+
+// Émet le quad d'un caractère de texte (bitmap font 8x8) : 6 vertices
+// tagués GT_BATCH_TEXT ; le flush échantillonne gt_font8x8 via `glyph`.
+static void gtBatchEmitGlyph(GtBatchRenderer* batch, float x, float y, float w, float h, GtColor color, char ch, float scale) {
+    GtBatchVertex v[6];
+    v[0] = (GtBatchVertex){ x, y, 0, 0, color, scale, -1, GT_BATCH_TEXT, (uint8_t)ch, {0} };
+    v[1] = (GtBatchVertex){ x + w, y, 0, 0, color, scale, -1, GT_BATCH_TEXT, (uint8_t)ch, {0} };
+    v[2] = (GtBatchVertex){ x, y + h, 0, 0, color, scale, -1, GT_BATCH_TEXT, (uint8_t)ch, {0} };
+    v[3] = (GtBatchVertex){ x + w, y, 0, 0, color, scale, -1, GT_BATCH_TEXT, (uint8_t)ch, {0} };
+    v[4] = (GtBatchVertex){ x + w, y + h, 0, 0, color, scale, -1, GT_BATCH_TEXT, (uint8_t)ch, {0} };
+    v[5] = (GtBatchVertex){ x, y + h, 0, 0, color, scale, -1, GT_BATCH_TEXT, (uint8_t)ch, {0} };
     
-    gtBatchEnsureCapacity(batch, (segments + 2) * 3); // Max vertices for triangle fan
-    
-    // Centre
-    GtBatchVertex center = { cx, cy, 0, 0, color, radius, -1, GT_BATCH_CIRCLE, {0} };
-    gtBatchAddVertex(batch, center);
-    
-    // Périphérie
-    for (int i = 0; i <= segments; i++) {
-        float angle = (float)i / segments * 2.0f * 3.14159265359f;
-        float x = cx + cosf(angle) * radius;
-        float y = cy + sinf(angle) * radius;
-        GtBatchVertex v = { x, y, 0, 0, color, radius, -1, GT_BATCH_CIRCLE, {0} };
-        gtBatchAddVertex(batch, v);
-    }
+    gtBatchEnsureCapacity(batch, 6);
+    for (int i = 0; i < 6; i++) gtBatchAddVertex(batch, v[i]);
 }
 
 // Rasterise une ligne en vertices (quad épais = 4 vertices)
@@ -3279,10 +3306,10 @@ static void gtBatchEmitLine(GtBatchRenderer* batch, float x1, float y1, float x2
     float ny = dx / len * 0.5f;
     
     GtBatchVertex v[4];
-    v[0] = (GtBatchVertex){ x1 + nx, y1 + ny, 0, 0, color, 0, -1, GT_BATCH_LINE, {0} };
-    v[1] = (GtBatchVertex){ x1 - nx, y1 - ny, 0, 0, color, 0, -1, GT_BATCH_LINE, {0} };
-    v[2] = (GtBatchVertex){ x2 + nx, y2 + ny, 0, 0, color, 0, -1, GT_BATCH_LINE, {0} };
-    v[3] = (GtBatchVertex){ x2 - nx, y2 - ny, 0, 0, color, 0, -1, GT_BATCH_LINE, {0} };
+    v[0] = (GtBatchVertex){ x1 + nx, y1 + ny, 0, 0, color, 0, -1, GT_BATCH_LINE, 0, {0} };
+    v[1] = (GtBatchVertex){ x1 - nx, y1 - ny, 0, 0, color, 0, -1, GT_BATCH_LINE, 0, {0} };
+    v[2] = (GtBatchVertex){ x2 + nx, y2 + ny, 0, 0, color, 0, -1, GT_BATCH_LINE, 0, {0} };
+    v[3] = (GtBatchVertex){ x2 - nx, y2 - ny, 0, 0, color, 0, -1, GT_BATCH_LINE, 0, {0} };
     
     gtBatchEnsureCapacity(batch, 4);
     for (int i = 0; i < 4; i++) gtBatchAddVertex(batch, v[i]);
@@ -3393,19 +3420,62 @@ void gtBatchFlush(GtBatchRenderer* batch) {
                 break;
             }
             case GT_BATCH_CIRCLE: {
-                // Triangle fan: center + perimeter vertices
-                int segments = 0;
-                for (int j = i + 1; j < batch->vertex_count && batch->vertices[j].prim_type == GT_BATCH_CIRCLE; j++) segments++;
-                if (segments >= 3) {
-                    // Draw as filled circle using existing function (center is first vertex)
-                    int cx = (int)v[0].x;
-                    int cy = (int)v[0].y;
-                    int radius = (int)v[0].radius;
-                    if (gtBatchCheckScissor(batch, cx - radius, cy - radius)) {
-                        gtDrawCircle(win, cx, cy, radius, v[0].color);
+                // 1 vertex = 1 cercle (centre) ; rayon et couleur portés par le vertex
+                int cx = (int)v[0].x;
+                int cy = (int)v[0].y;
+                int radius = (int)v[0].radius;
+                if (radius > 0 && gtBatchCheckScissor(batch, cx - radius, cy - radius)) {
+                    gtDrawCircle(win, cx, cy, radius, v[0].color);
+                }
+                i += 1;
+                batch->draw_calls++;
+                break;
+            }
+            case GT_BATCH_TEXT: {
+                // 6 vertices = quad d'un caractère ; échantillonne la bitmap font 8x8
+                if (i + 5 < batch->vertex_count && v[0].glyph >= 32 && v[0].glyph <= 126) {
+                    float x = v[0].x;
+                    float y = v[0].y;
+                    float w = v[1].x - v[0].x;
+                    float h = v[2].y - v[0].y;
+
+                    // Clip contre fenêtre
+                    int ix = (int)x; if (ix < 0) ix = 0;
+                    int iy = (int)y; if (iy < 0) iy = 0;
+                    int iw = (int)w; if (ix + iw > win->width) iw = win->width - ix;
+                    int ih = (int)h; if (iy + ih > win->height) ih = win->height - iy;
+
+                    if (iw > 0 && ih > 0 && gtBatchClipRectScissor(batch, &ix, &iy, &iw, &ih)) {
+                        // Même logique que gtDrawChar : blocs [row*scale,(row+1)*scale) x [col*scale,(col+1)*scale)
+                        const uint8_t* glyph_data = &gt_font8x8[(v[0].glyph - 32) * 8];
+                        float scale = (v[0].radius > 0.0f) ? v[0].radius : (float)h / 8.0f;
+                        uint32_t color = v[0].color;
+                        bool opaque = ((color >> 24) == 255);
+
+                        for (int row = 0; row < 8; row++) {
+                            uint8_t bits = glyph_data[row];
+                            if (!bits) continue;
+                            int py_start = (int)(y + row * scale);
+                            int py_end = (int)(y + (row + 1) * scale);
+                            if (py_start < iy) py_start = iy;
+                            if (py_end > iy + ih) py_end = iy + ih;
+                            for (int col = 0; col < 8; col++) {
+                                if (!(bits & (0x80 >> col))) continue;
+                                int px_start = (int)(x + col * scale);
+                                int px_end = (int)(x + (col + 1) * scale);
+                                if (px_start < ix) px_start = ix;
+                                if (px_end > ix + iw) px_end = ix + iw;
+                                for (int py = py_start; py < py_end; py++) {
+                                    uint32_t* row_ptr = &win->buffer[(size_t)py * (size_t)win->width];
+                                    for (int px = px_start; px < px_end; px++) {
+                                        row_ptr[px] = opaque ? (color | 0xFF000000u) : gtBlendPixel(row_ptr[px], color);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                i += segments + 1;
+                i += 6;
                 batch->draw_calls++;
                 break;
             }
@@ -3456,7 +3526,7 @@ void gtBatchAddLine(GtBatchRenderer* batch, float x1, float y1, float x2, float 
 void gtBatchAddCircle(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color) {
     if (!batch || !batch->began || radius <= 0) return;
     GtVec2 p = gtBatchApplyTransform(batch, gtVec2(cx, cy));
-    gtBatchEmitCircle(batch, p.x, p.y, radius, color, 16);
+    gtBatchEmitCircle(batch, p.x, p.y, radius, color);
 }
 
 void gtBatchAddCircleLines(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color) {
@@ -3512,9 +3582,9 @@ void gtBatchAddText(GtBatchRenderer* batch, const char* text, float x, float y,
             continue;
         }
         if (*c < 32 || *c > 126) continue;
-        
-        // Pour le texte, on émet un rect par caractère
-        gtBatchEmitRect(batch, (float)cur_x, (float)cur_y, (float)char_w, (float)(8 * scale), color, -1, 0, 0, 1, 1);
+
+        // Un quad par caractère ; le flush échantillonne la bitmap font 8x8
+        gtBatchEmitGlyph(batch, (float)cur_x, (float)cur_y, (float)char_w, (float)(8 * scale), color, *c, scale);
         cur_x += char_w + spacing;
     }
 }
@@ -4571,10 +4641,14 @@ int gtECSSystemHealthDeath(GtECS* ecs) {
 static inline void gtECSGetSpriteRect(const GtECS* ecs, int idx, float* out_x, float* out_y, float* out_w, float* out_h) {
     const GtTransform* t = &ecs->transforms[idx];
     const GtSprite* s = &ecs->sprites[idx];
-    // Note: taille réelle nécessite GtImage, ici on suppose taille = 32x32 par défaut
-    // L'utilisateur doit surcharger size dans le sprite s'il veut une taille précise
-    float w = (s->size.x > 0) ? s->size.x : 32.0f;
-    float h = (s->size.y > 0) ? s->size.y : 32.0f;
+    // Taille effective, axe par axe : size explicite > dimensions de l'image
+    // > 32x32 en dernier recours (sprite sans image, placeholder de rendu).
+    float w = s->size.x;
+    float h = s->size.y;
+    if (w <= 0.0f && s->image) w = (float)gtImageGetWidth(s->image);
+    if (h <= 0.0f && s->image) h = (float)gtImageGetHeight(s->image);
+    if (w <= 0.0f) w = 32.0f;
+    if (h <= 0.0f) h = 32.0f;
     float scale = fabsf(t->scale);
     w *= scale;
     h *= scale;
@@ -4624,14 +4698,22 @@ void gtECSSystemRenderSprites(GtECS* ecs, GtRenderer* renderer) {
         int idx = items[i].idx;
         GtSprite* s = &ecs->sprites[idx];
 
-        // Sans GtImage pour l'instant : dessine un rectangle coloré comme placeholder
-        // L'utilisateur doit implémenter son propre système de rendu avec GtImage
         float x, y, w, h;
         gtECSGetSpriteRect(ecs, idx, &x, &y, &w, &h);
 
-        GtColor color = s->tint;
-        gtRendererDrawRect(renderer, (int)x, (int)y, (int)w, (int)h, color);
-        gtRendererDrawRectLines(renderer, (int)x, (int)y, (int)w, (int)h, GT_WHITE);
+        if (s->image) {
+            // Image réelle : dessinée via le renderer, avec teinte et flips.
+            // TODO: la rotation de GtTransform reste ignorée (AABB seulement),
+            // comme pour l'API directe gtRendererDrawImageEx.
+            gtRendererDrawImageEx(renderer, s->image,
+                                  (int)x, (int)y, (int)w, (int)h,
+                                  0.0f, gtVec2(0, 0), s->flip_x, s->flip_y,
+                                  s->tint);
+        } else {
+            // Sans image : rectangle teinté + contour comme placeholder
+            gtRendererDrawRect(renderer, (int)x, (int)y, (int)w, (int)h, s->tint);
+            gtRendererDrawRectLines(renderer, (int)x, (int)y, (int)w, (int)h, GT_WHITE);
+        }
     }
 
     free(items);
@@ -5049,6 +5131,48 @@ GtInputSystem* gtInputCreate(void) {
     return input;
 }
 
+// --- Helpers internes : ownership des noms ---
+// Convention : les noms de maps/actions sont TOUJOURS des copies possédées
+// par la structure qui les porte (_strdup). Toute copie de map entre
+// structures passe par gtInputDeepCopyMap pour éviter le partage de
+// pointeurs (et donc les double-free).
+
+// Libère les noms possédés d'une map (tous les slots ; free(NULL) est un no-op)
+static void gtInputFreeMapNames(GtActionMap* map) {
+    if (!map) return;
+    free((void*)map->name);
+    map->name = NULL;
+    for (int a = 0; a < GT_MAX_ACTIONS_PER_MAP; a++) {
+        free((void*)map->actions[a].name);
+        map->actions[a].name = NULL;
+    }
+}
+
+// Copie profonde d'une map : dst libère ses anciens noms, puis re-duplique
+// ceux de src. src reste inchangé et conserve la propriété de ses noms.
+static void gtInputDeepCopyMap(GtActionMap* dst, const GtActionMap* src) {
+    gtInputFreeMapNames(dst);
+    *dst = *src;                    // copie bindings/états (noms aliasés un instant)
+    dst->name = NULL;               // …réinitialisés immédiatement avant re-duplication
+    for (int a = 0; a < GT_MAX_ACTIONS_PER_MAP; a++) dst->actions[a].name = NULL;
+    if (src->name) dst->name = _strdup(src->name);
+
+    int count = src->action_count;
+    if (count < 0) count = 0;
+    if (count > GT_MAX_ACTIONS_PER_MAP) count = GT_MAX_ACTIONS_PER_MAP;
+    for (int a = 0; a < count; a++) {
+        if (src->actions[a].name) dst->actions[a].name = _strdup(src->actions[a].name);
+    }
+}
+
+// Libère les noms possédés par toutes les maps d'un profil
+static void gtInputFreeProfileNames(GtPlayerProfile* profile) {
+    if (!profile) return;
+    for (int m = 0; m < profile->map_count && m < GT_MAX_MAPS_PER_PROFILE; m++) {
+        gtInputFreeMapNames(&profile->maps[m]);
+    }
+}
+
 // Détruit le système d'input
 void gtInputDestroy(GtInputSystem* input) {
     if (!input) return;
@@ -5057,7 +5181,18 @@ void gtInputDestroy(GtInputSystem* input) {
         XINPUT_VIBRATION vib = {0, 0};
         gtXInputSetState(i, &vib);
     }
+    // Libère les noms dupliqués des profils possédés par le système
+    for (int i = 0; i < GT_MAX_PLAYERS; i++) {
+        gtInputFreeProfileNames(&input->profiles[i]);
+    }
     free(input);
+}
+
+// Libère un profil possédé par l'appelant (typiquement après gtInputLoadProfile)
+void gtInputDestroyProfile(GtPlayerProfile* profile) {
+    if (!profile) return;
+    gtInputFreeProfileNames(profile);
+    memset(profile, 0, sizeof(*profile));
 }
 
 // Met à jour le système d'input (appeler chaque frame après gtEventsWindow)
@@ -5133,8 +5268,33 @@ GtPlayerProfile* gtInputGetProfile(GtInputSystem* input, int player_index) {
 
 void gtInputSetProfile(GtInputSystem* input, int player_index, const GtPlayerProfile* profile) {
     if (!input || player_index < 0 || player_index >= GT_MAX_PLAYERS || !profile) return;
-    input->profiles[player_index] = *profile;
-    input->profiles[player_index].player_index = player_index;
+    GtPlayerProfile* dst = &input->profiles[player_index];
+
+    int count = profile->map_count;
+    if (count < 0) count = 0;
+    if (count > GT_MAX_MAPS_PER_PROFILE) count = GT_MAX_MAPS_PER_PROFILE;
+
+    // Copie profonde : le système duplique les noms des maps, le profil
+    // source reste intact et demeure la propriété de l'appelant.
+    for (int m = 0; m < GT_MAX_MAPS_PER_PROFILE; m++) {
+        gtInputFreeMapNames(&dst->maps[m]);          // anciens noms du système
+        memset(&dst->maps[m], 0, sizeof(GtActionMap));
+        if (m < count) {
+            gtInputDeepCopyMap(&dst->maps[m], &profile->maps[m]);
+        }
+    }
+
+    // Settings et stacks copiés tels quels
+    dst->player_index = player_index;
+    dst->stick_deadzone = profile->stick_deadzone;
+    dst->trigger_threshold = profile->trigger_threshold;
+    dst->vibration_strength = profile->vibration_strength;
+    dst->gamepad_connected = profile->gamepad_connected;
+    dst->mouse_sensitivity = profile->mouse_sensitivity;
+    dst->invert_y = profile->invert_y;
+    memcpy(dst->active_map_stack, profile->active_map_stack, sizeof(dst->active_map_stack));
+    dst->active_map_count = (profile->active_map_count >= 0) ? profile->active_map_count : 0;
+    dst->map_count = count;
 }
 
 // Action Maps
@@ -5142,14 +5302,14 @@ GtActionMap* gtInputCreateMap(const char* name) {
     if (!name) return NULL;
     GtActionMap* map = (GtActionMap*)calloc(1, sizeof(GtActionMap));
     if (!map) return NULL;
-    map->name = name; // L'utilisateur gère la durée de vie de la string
+    map->name = _strdup(name); // Copie possédée : la chaîne passée peut être temporaire
     map->enabled = true;
     return map;
 }
 
 void gtInputDestroyMap(GtActionMap* map) {
     if (!map) return;
-    // Les actions contiennent juste des strings et des bindings (pas d'allocs)
+    gtInputFreeMapNames(map); // Libère les copies des noms de map et d'actions
     free(map);
 }
 
@@ -5157,9 +5317,10 @@ void gtInputAddAction(GtActionMap* map, const char* action_name) {
     if (!map || !action_name) return;
     if (map->action_count >= GT_MAX_ACTIONS_PER_MAP) return;
     if (gtInputFindAction(map, action_name)) return; // Déjà existante
-    
+
     GtAction* action = &map->actions[map->action_count];
-    action->name = action_name; // L'utilisateur gère la durée de vie
+    action->name = _strdup(action_name); // Copie possédée
+    if (!action->name) return;
     action->binding_count = 0;
     action->is_pressed = false;
     action->was_pressed = false;
@@ -5250,8 +5411,9 @@ void gtInputPushMap(GtPlayerProfile* profile, GtActionMap* map) {
     }
 
     // (Re)copie le contenu : re-pusher une map après rebinding rafraîchit
-    // la copie stockée dans le profil.
-    profile->maps[map_idx] = *map;
+    // la copie stockée dans le profil. Copie PROFONDE : le profil duplique
+    // les noms, la map source reste la propriété de l'appelant.
+    gtInputDeepCopyMap(&profile->maps[map_idx], map);
 
     // Déjà active ? -> pas de doublon dans la stack (une map présente deux
     // fois serait mise à jour 2x par frame et casserait l'edge detection).
@@ -5275,6 +5437,8 @@ void gtInputPopMap(GtPlayerProfile* profile) {
 void gtInputSetActiveMap(GtPlayerProfile* profile, GtActionMap* map) {
     if (!profile || !map) return;
     profile->active_map_count = 0;
+    // Libère les noms de l'ancien contenu avant de vider le stockage
+    gtInputFreeProfileNames(profile);
     profile->map_count = 0;
     gtInputPushMap(profile, map);
 }
@@ -5496,6 +5660,9 @@ bool gtInputLoadProfile(GtPlayerProfile* profile, const char* filepath) {
         return false;
     }
     
+    // Libère les noms d'un éventuel contenu précédent avant le reset
+    gtInputFreeProfileNames(profile);
+
     // Reset profil
     memset(profile, 0, sizeof(*profile));
     profile->player_index = hdr.player_index;
