@@ -8,7 +8,7 @@
 #include <math.h>      // sqrtf, sinf, cosf, etc.
 
 /* =========================================================================
-* LIBGT - Bibliothèque graphique 2D légère pour Windows (GDI / futur D2D)
+* LIBGT - Bibliothèque graphique 2D légère pour Windows (GDI)
 * =========================================================================
 * Philosophie :
 *   - API simple, proche du matériel (framebuffer CPU)
@@ -131,6 +131,186 @@ static inline GtVec2 gtVec2Norm(GtVec2 v) {
 // Interpolation linéaire : a + t * (b - a), t dans [0,1]
 // Utile pour : mouvement fluide, transitions, lerp de couleur
 static inline GtVec2 gtVec2Lerp(GtVec2 a, GtVec2 b, float t) { return gtVec2Add(a, gtVec2Mul(gtVec2Sub(b, a), t)); }
+
+/* =========================================================================
+* MATRICE 3x3 (GtMat3) - Transformations 2D homogènes
+* =========================================================================
+* Matrice 3x3 en ordre colonne-majeur (column-major) compatible GLSL/DirectXMath :
+*   [ m00 m10 m20 ]   [ a c tx ]
+*   [ m01 m11 m21 ] = [ b d ty ]
+*   [ m02 m12 m22 ]   [ 0 0  1 ]
+* Représente : translation, rotation, scale, shear en coordonnées homogènes.
+* Multiplication : M * v  (v en coordonnées homogènes = vec3(x, y, 1))
+* Ordre d'application : M = T * R * S (translation * rotation * scale)
+* ========================================================================= */
+typedef struct GtMat3 {
+    float m[9];  // Colonne-majeur : m[0]=m00, m[1]=m01, m[2]=m02, m[3]=m10, etc.
+} GtMat3;
+
+// Matrice identité
+static inline GtMat3 gtMat3Identity(void) {
+    GtMat3 m = {{ 1,0,0,  0,1,0,  0,0,1 }};
+    return m;
+}
+
+// Matrice de translation
+static inline GtMat3 gtMat3Translate(float tx, float ty) {
+    GtMat3 m = {{ 1,0,0,  0,1,0,  tx,ty,1 }};
+    return m;
+}
+static inline GtMat3 gtMat3TranslateV(GtVec2 v) { return gtMat3Translate(v.x, v.y); }
+
+// Matrice de rotation (angle en radians)
+static inline GtMat3 gtMat3Rotate(float angle_rad) {
+    float c = cosf(angle_rad);
+    float s = sinf(angle_rad);
+    GtMat3 m = {{ c,-s,0,  s,c,0,  0,0,1 }};
+    return m;
+}
+
+// Matrice de scale (uniforme ou non-uniforme)
+static inline GtMat3 gtMat3Scale(float sx, float sy) {
+    GtMat3 m = {{ sx,0,0,  0,sy,0,  0,0,1 }};
+    return m;
+}
+static inline GtMat3 gtMat3ScaleV(GtVec2 v) { return gtMat3Scale(v.x, v.y); }
+static inline GtMat3 gtMat3ScaleUniform(float s) { return gtMat3Scale(s, s); }
+
+// Multiplication matrice * matrice (a * b) - applique b puis a
+static inline GtMat3 gtMat3Mul(GtMat3 a, GtMat3 b) {
+    GtMat3 r;
+    r.m[0] = a.m[0]*b.m[0] + a.m[3]*b.m[1] + a.m[6]*b.m[2];
+    r.m[1] = a.m[1]*b.m[0] + a.m[4]*b.m[1] + a.m[7]*b.m[2];
+    r.m[2] = a.m[2]*b.m[0] + a.m[5]*b.m[1] + a.m[8]*b.m[2];
+    r.m[3] = a.m[0]*b.m[3] + a.m[3]*b.m[4] + a.m[6]*b.m[5];
+    r.m[4] = a.m[1]*b.m[3] + a.m[4]*b.m[4] + a.m[7]*b.m[5];
+    r.m[5] = a.m[2]*b.m[3] + a.m[5]*b.m[4] + a.m[8]*b.m[5];
+    r.m[6] = a.m[0]*b.m[6] + a.m[3]*b.m[7] + a.m[6]*b.m[8];
+    r.m[7] = a.m[1]*b.m[6] + a.m[4]*b.m[7] + a.m[7]*b.m[8];
+    r.m[8] = a.m[2]*b.m[6] + a.m[5]*b.m[7] + a.m[8]*b.m[8];
+    return r;
+}
+
+// Multiplication matrice * vecteur (point, w=1) - transforme une position
+static inline GtVec2 gtMat3MulVec2(GtMat3 m, GtVec2 v) {
+    float x = m.m[0]*v.x + m.m[3]*v.y + m.m[6];
+    float y = m.m[1]*v.x + m.m[4]*v.y + m.m[7];
+    float w = m.m[2]*v.x + m.m[5]*v.y + m.m[8];
+    return (w != 0.0f) ? gtVec2(x/w, y/w) : gtVec2(x, y);
+}
+
+// Multiplication matrice * vecteur (direction, w=0) - transforme un vecteur (sans translation)
+static inline GtVec2 gtMat3MulDir(GtMat3 m, GtVec2 v) {
+    return gtVec2(m.m[0]*v.x + m.m[3]*v.y, m.m[1]*v.x + m.m[4]*v.y);
+}
+
+// Inverse d'une matrice 2D affine (translation + rotation + scale, sans shear/projection)
+// Retourne identité si matrice non-inversible (determinant ~ 0)
+static inline GtMat3 gtMat3Inverse(GtMat3 m) {
+    // Sous-matrice 2x2 linéaire
+    float a = m.m[0], b = m.m[3];
+    float c = m.m[1], d = m.m[4];
+    float tx = m.m[6], ty = m.m[7];
+    float det = a*d - b*c;
+    if (fabsf(det) < 1e-6f) return gtMat3Identity();
+    float inv_det = 1.0f / det;
+    GtMat3 r;
+    r.m[0] =  d * inv_det;
+    r.m[3] = -b * inv_det;
+    r.m[1] = -c * inv_det;
+    r.m[4] =  a * inv_det;
+    r.m[6] = (b*ty - d*tx) * inv_det;
+    r.m[7] = (c*tx - a*ty) * inv_det;
+    r.m[2] = 0; r.m[5] = 0; r.m[8] = 1;
+    return r;
+}
+
+// Transpose de matrice 3x3
+static inline GtMat3 gtMat3Transpose(GtMat3 m) {
+    GtMat3 r;
+    r.m[0] = m.m[0]; r.m[3] = m.m[1]; r.m[6] = m.m[2];
+    r.m[1] = m.m[3]; r.m[4] = m.m[4]; r.m[7] = m.m[5];
+    r.m[2] = m.m[6]; r.m[5] = m.m[7]; r.m[8] = m.m[8];
+    return r;
+}
+
+// Extraction composants (pour debug / décomposition)
+static inline GtVec2 gtMat3GetTranslation(GtMat3 m) { return gtVec2(m.m[6], m.m[7]); }
+static inline float  gtMat3GetRotation(GtMat3 m)    { return atan2f(m.m[1], m.m[0]); }
+static inline GtVec2 gtMat3GetScale(GtMat3 m)       { return gtVec2(sqrtf(m.m[0]*m.m[0] + m.m[1]*m.m[1]), sqrtf(m.m[3]*m.m[3] + m.m[4]*m.m[4])); }
+
+/* =========================================================================
+* CAMERA 2D (GtCamera)
+* =========================================================================
+* Caméra avec position, zoom, rotation.
+* Produit une matrice view (world->screen) et projection combinée.
+* Coordonnées monde : Y vers le haut (standard mathématique)
+* Coordonnées écran : Y vers le bas (GDI)
+* La caméra gère la conversion automatiquement.
+* ========================================================================= */
+typedef struct GtCamera {
+    GtVec2 position;    // Position monde (centre de la vue)
+    float rotation;     // Rotation en radians
+    float zoom;         // Zoom (1.0 = 1:1, 2.0 = 2x, 0.5 = 0.5x)
+    int viewport_w;     // Largeur viewport (pixels écran)
+    int viewport_h;     // Hauteur viewport (pixels écran)
+    GtMat3 view_matrix;     // World -> Screen (mis à jour par gtCameraUpdate)
+    GtMat3 inv_view_matrix; // Screen -> World (mis à jour par gtCameraUpdate)
+} GtCamera;
+
+// Crée une caméra centrée sur (0,0) avec zoom 1.0
+static inline GtCamera gtCameraCreate(GtVec2 position, float zoom, int viewport_w, int viewport_h) {
+    GtCamera cam = { position, 0.0f, zoom, viewport_w, viewport_h, {{0}}, {{0}} };
+    return cam;
+}
+
+// Met à jour les matrices view / inverse_view de la caméra
+// À appeler quand position/rotation/zoom/viewport changent
+static inline void gtCameraUpdate(GtCamera* cam) {
+    if (!cam) return;
+    // View = T(-pos) * R(-rot) * S(zoom) * FlipY * T(viewport/2)
+    // FlipY convertit monde (Y up) -> écran (Y down)
+    GtMat3 flip_y = {{ 1,0,0,  0,-1,0,  0,0,1 }};
+    GtMat3 center = gtMat3Translate(cam->viewport_w * 0.5f, cam->viewport_h * 0.5f);
+    GtMat3 scale = gtMat3ScaleUniform(cam->zoom);
+    GtMat3 rot = gtMat3Rotate(-cam->rotation);
+    GtMat3 trans = gtMat3Translate(-cam->position.x, -cam->position.y);
+    
+    // M = center * flip_y * scale * rot * trans
+    cam->view_matrix = gtMat3Mul(center, gtMat3Mul(flip_y, gtMat3Mul(scale, gtMat3Mul(rot, trans))));
+    cam->inv_view_matrix = gtMat3Inverse(cam->view_matrix);
+}
+
+// Convertit coordonnées monde -> écran (pixels)
+static inline GtVec2 gtCameraWorldToScreen(const GtCamera* cam, GtVec2 world) {
+    return gtMat3MulVec2(cam->view_matrix, world);
+}
+
+// Convertit coordonnées écran -> monde
+static inline GtVec2 gtCameraScreenToWorld(const GtCamera* cam, GtVec2 screen) {
+    return gtMat3MulVec2(cam->inv_view_matrix, screen);
+}
+
+// Récupère la matrice view-projection combinée pour le renderer
+static inline GtMat3 gtCameraGetViewProj(const GtCamera* cam) {
+    return cam->view_matrix;
+}
+
+/* =========================================================================
+* TRANSFORM HELPERS (pour entités / sprites)
+* =========================================================================
+* Crée une matrice modèle (model matrix) depuis position, rotation, scale, origin
+* origin : ancrage relatif (0,0 = coin haut-gauche, 0.5,0.5 = centre, 1,1 = coin bas-droit)
+* Utilisé pour dessiner sprites/entités avec transform complète.
+* ========================================================================= */
+static inline GtMat3 gtTransformModel(GtVec2 pos, float rot, float scale, GtVec2 origin, GtVec2 size) {
+    // M = T(pos) * R(rot) * S(scale) * T(-origin * size)
+    GtMat3 t_pos = gtMat3Translate(pos.x, pos.y);
+    GtMat3 t_rot = gtMat3Rotate(rot);
+    GtMat3 t_scale = gtMat3ScaleUniform(scale);
+    GtMat3 t_origin = gtMat3Translate(-origin.x * size.x, -origin.y * size.y);
+    return gtMat3Mul(t_pos, gtMat3Mul(t_rot, gtMat3Mul(t_scale, t_origin)));
+}
 
 /* =========================================================================
 * COULEURS (GtColor + constructeurs RGBA)
@@ -369,21 +549,21 @@ bool gtTimerActive(uint32_t timer_id);
 int gtTimersUpdate(float dt);
 
 /* =========================================================================
-* RENDERER ABSTRACTION (Backend GDI + préparation D2D / Vulkan / etc.)
+* RENDERER (Backend GDI)
 * =========================================================================
 * Pourquoi une abstraction Renderer ?
-*   - Découple l'API de dessin du backend (GDI aujourd'hui, D2D/Vulkan demain)
+*   - Centralise l'API de dessin autour du backend GDI
 *   - Permet de changer de backend sans toucher au code du jeu
 *   - Prépare l'architecture pour : anti-aliasing, batching, shaders, 3D
 *   - GDI = fallback simple, CPU-only, compatible partout (WinXP+)
-*   - D2D = GPU-accéléré, AA natif, texte qualité, mais plus complexe
+*   - GDI = rendu CPU simple et prévisible
 *
 * Architecture :
 *   GtRenderer (opaque) contient :
 *     - window : pointeur vers la fenêtre cible
-*     - type   : GT_RENDERER_GDI ou GT_RENDERER_D2D
+*     - type   : GT_RENDERER_GDI
 *     - hdc    : Device Context GDI (pour blitting final)
-*     - (champs D2D réservés pour futur)
+*     - aucun état backend supplémentaire requis
 *
 * Flux de rendu typique :
 *   GtRenderer* r = gtCreateRenderer(win, GT_RENDERER_GDI);
@@ -391,11 +571,11 @@ int gtTimersUpdate(float dt);
 *       gtBeginFrame();
 *       gtEventsWindow(win);
 *
-*       gtRendererBegin(r);           // Prépare le frame (D2D: BeginDraw)
+*       gtRendererBegin(r);           // Prépare le frame
 *       gtRendererClear(r, GT_BLACK); // Efface le framebuffer
 *       gtRendererDrawRect(r, ...);   // Dessine via API Renderer
 *       gtRendererDrawCircle(r, ...);
-*       gtRendererEnd(r);             // Affiche (GDI: StretchDIBits, D2D: EndDraw+Present)
+*       gtRendererEnd(r);             // Affiche le framebuffer via GDI
 *   }
 *   gtDestroyRenderer(r);
 *
@@ -405,15 +585,14 @@ int gtTimersUpdate(float dt);
 
 // Type de backend de rendu
 typedef enum {
-    GT_RENDERER_GDI,   // GDI software (framebuffer CPU + StretchDIBits) - défaut, toujours dispo
-    GT_RENDERER_D2D    // Direct2D (GPU, hardware-accéléré) - pas encore implémenté, fallback GDI
+    GT_RENDERER_GDI   // GDI software (framebuffer CPU + StretchDIBits) - défaut, toujours dispo
 } GtRendererType;
 
 // Structure opaque du renderer (détails dans section IMPLEMENTATION)
 typedef struct GtRenderer GtRenderer;
 
 // Crée un renderer pour une fenêtre donnée
-// type : GT_RENDERER_GDI (recommandé) ou GT_RENDERER_D2D (fallback GDI si indisponible)
+// type : GT_RENDERER_GDI
 // Retourne NULL si échec (fenêtre invalide, GetDC échoue, OOM)
 GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type);
 
@@ -424,26 +603,81 @@ void        gtDestroyRenderer(GtRenderer* renderer);
 // API DE DESSIN VIA RENDERER (remplace gtDraw* sur GtWindow)
 // =========================================================================
 
-// Début de frame : prépare le backend (GDI = nop, D2D = BeginDraw)
+// Début de frame : GDI n'a rien à préparer
 // À appeler AVANT tout dessin dans la frame
 void gtRendererBegin(GtRenderer* renderer);
 
 // Fin de frame : présente le résultat à l'écran
 // GDI = StretchDIBits (blit framebuffer -> window)
-// D2D = EndDraw() + Present()
+// GDI : le framebuffer est présenté à la fin de la frame
 void gtRendererEnd(GtRenderer* renderer);
 
 // Efface le framebuffer avec une couleur (délègue à gtClearWindow)
 void gtRendererClear(GtRenderer* renderer, GtColor color);
 
 // Primitives de dessin (délèguent aux gtDraw* de GtWindow pour GDI)
-// Pour D2D futur : appelleront ID2D1RenderTarget::DrawRectangle, etc.
+// Pour GDI : dessinent directement dans le framebuffer CPU.
 void gtRendererDrawPixel(GtRenderer* renderer, int x, int y, GtColor color);
 void gtRendererDrawRect(GtRenderer* renderer, int x, int y, int w, int h, GtColor color);
 void gtRendererDrawRectLines(GtRenderer* renderer, int x, int y, int w, int h, GtColor color);
 void gtRendererDrawLine(GtRenderer* renderer, int x1, int y1, int x2, int y2, GtColor color);
 void gtRendererDrawCircle(GtRenderer* renderer, int cx, int cy, int radius, GtColor color);
 void gtRendererDrawCircleLines(GtRenderer* renderer, int cx, int cy, int radius, GtColor color);
+
+/* =========================================================================
+* TRANSFORMATIONS 2D VIA RENDERER (Camera, World↔Screen, Matrix stack)
+* =========================================================================
+* Le renderer maintient une matrice de transformation courante (model-view-projection)
+* qui est appliquée à toutes les primitives de dessin suivantes.
+* Pile de matrices (push/pop) pour transformations imbriquées (ex: UI dans monde).
+* ========================================================================= */
+
+// Définit la matrice de transformation courante (remplace l'existante)
+// Passe NULL pour réinitialiser à l'identité (pixels écran directs)
+void gtRendererSetTransform(GtRenderer* renderer, const GtMat3* transform);
+
+// Récupère la matrice de transformation courante (peut être NULL si identité)
+const GtMat3* gtRendererGetTransform(const GtRenderer* renderer);
+
+// Push/pop de la pile de transformations (imbrication)
+void gtRendererPushTransform(GtRenderer* renderer);
+void gtRendererPopTransform(GtRenderer* renderer);
+
+// Multiplie la matrice courante par une matrice (post-multiplication: current * m)
+void gtRendererMultiplyTransform(GtRenderer* renderer, const GtMat3* m);
+
+// Helpers pour transformations courantes (appliquées sur la matrice courante)
+void gtRendererTranslate(GtRenderer* renderer, float tx, float ty);
+void gtRendererRotate(GtRenderer* renderer, float angle_rad);
+void gtRendererScale(GtRenderer* renderer, float sx, float sy);
+
+// Applique une caméra (définit view matrix = camera view-proj)
+void gtRendererSetCamera(GtRenderer* renderer, const GtCamera* camera);
+
+// Récupère la caméra active (si définie via gtRendererSetCamera)
+const GtCamera* gtRendererGetCamera(const GtRenderer* renderer);
+
+// Conversion coordonnées monde <-> écran via la caméra/transform courante
+GtVec2 gtRendererWorldToScreen(const GtRenderer* renderer, GtVec2 world);
+GtVec2 gtRendererScreenToWorld(const GtRenderer* renderer, GtVec2 screen);
+
+/* =========================================================================
+* SCISSOR / CLIPPING RECT (2.4)
+* =========================================================================
+* Rectangle de découpage (scissor test) : limite le dessin à une zone rectangulaire.
+* Pile de rectangles pour imbrication (UI scrollable, viewports, split-screen).
+* Coordonnées en espace ÉCRAN (pixels, origine haut-gauche).
+* ========================================================================= */
+
+// Définit le rectangle de clipping courant (NULL = pas de clipping / tout l'écran)
+void gtRendererSetScissorRect(GtRenderer* renderer, int x, int y, int w, int h);
+
+// Push/pop du rectangle de clipping (imbrication)
+void gtRendererPushScissorRect(GtRenderer* renderer, int x, int y, int w, int h);
+void gtRendererPopScissorRect(GtRenderer* renderer);
+
+// Récupère le rectangle de clipping actif
+void gtRendererGetScissorRect(const GtRenderer* renderer, int* out_x, int* out_y, int* out_w, int* out_h);
 
 // Dessin de texte via renderer
 void gtRendererDrawText(GtRenderer* renderer, int x, int y, const char* text, GtColor color);
@@ -458,10 +692,119 @@ void gtRendererDrawImage(GtRenderer* renderer, GtImage* image, int x, int y, GtC
 void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image, int x, int y, int w, int h,
                            float rot, GtVec2 origin, bool flip_x, bool flip_y, GtColor tint);
 
+// Dessin d'image avec transformation complète (matrice modèle)
+void gtRendererDrawImageTransformed(GtRenderer* renderer, GtImage* image, const GtMat3* model, GtColor tint);
+
+/* =========================================================================
+* BATCH RENDERING (2.1) - Vertex Buffer + Single Draw Call
+* =========================================================================
+* Permet de soumettre des milliers de sprites/primitives en un seul appel.
+* Buffer de vertex dynamique (CPU) -> flush unique par frame.
+* Supporte : rects, images, cercles, lignes avec transform/scissor/couleur par vertex.
+* ========================================================================= */
+
+// Types de primitives pour le batch
+typedef enum {
+    GT_BATCH_RECT,        // Rectangle plein
+    GT_BATCH_RECT_LINES,  // Rectangle contour
+    GT_BATCH_LINE,        // Ligne
+    GT_BATCH_CIRCLE,      // Cercle plein
+    GT_BATCH_CIRCLE_LINES,// Cercle contour
+    GT_BATCH_IMAGE,       // Image (sprite)
+    GT_BATCH_TEXT         // Texte (bitmap font)
+} GtBatchPrimitiveType;
+
+// Vertex pour le batch rendering (32 bytes aligné)
+typedef struct GtBatchVertex {
+    float x, y;           // Position écran (après transform)
+    float u, v;           // UV (0-1 pour images, inutilisé pour primitives)
+    uint32_t color;       // Couleur ARGB
+    float radius;         // Rayon pour cercles, 0 sinon
+    int image_id;         // Index dans le tableau d'images du batch (-1 = pas d'image)
+    uint8_t prim_type;    // GtBatchPrimitiveType
+    uint8_t pad[3];       // Padding pour alignement 32 bytes
+} GtBatchVertex;
+
+// Configuration du batch renderer
+typedef struct GtBatchConfig {
+    int max_vertices;     // Capacité max vertices (défaut: 65536)
+    int max_images;       // Max images différentes par batch (défaut: 256)
+    bool auto_flush;      // Flush auto quand buffer plein
+} GtBatchConfig;
+
+// État du batch renderer (opaque)
+typedef struct GtBatchRenderer GtBatchRenderer;
+
+// Crée un batch renderer attaché à un renderer
+GtBatchRenderer* gtBatchCreate(GtRenderer* renderer, const GtBatchConfig* config);
+
+// Détruit le batch renderer
+void gtBatchDestroy(GtBatchRenderer* batch);
+
+// Début d'un batch (appeler une fois par frame, avant tout ajout)
+void gtBatchBegin(GtBatchRenderer* batch);
+
+// Fin du batch + flush vers le renderer (appeler une fois par frame, après tout ajout)
+void gtBatchEnd(GtBatchRenderer* batch);
+
+// Flush manuel (vide le buffer vers le renderer sans finir le batch)
+void gtBatchFlush(GtBatchRenderer* batch);
+
+// Ajoute un rectangle au batch
+void gtBatchAddRect(GtBatchRenderer* batch, float x, float y, float w, float h, GtColor color);
+
+// Ajoute un rectangle contour au batch
+void gtBatchAddRectLines(GtBatchRenderer* batch, float x, float y, float w, float h, GtColor color);
+
+// Ajoute une ligne au batch
+void gtBatchAddLine(GtBatchRenderer* batch, float x1, float y1, float x2, float y2, GtColor color);
+
+// Ajoute un cercle plein au batch
+void gtBatchAddCircle(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color);
+
+// Ajoute un cercle contour au batch
+void gtBatchAddCircleLines(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color);
+
+// Ajoute une image (sprite) au batch
+// image : GtImage* chargé, uv_rect : portion de l'image à utiliser (0,0,1,1 = image complète)
+// origin : ancrage (0,0=coin, 0.5,0.5=centre), rot : rotation radians, scale : échelle
+void gtBatchAddImage(GtBatchRenderer* batch, GtImage* image, float x, float y, 
+                     float w, float h, GtColor tint,
+                     float u0, float v0, float u1, float v1,
+                     GtVec2 origin, float rot, float scale);
+
+// Ajoute du texte au batch (bitmap font 8x8)
+void gtBatchAddText(GtBatchRenderer* batch, const char* text, float x, float y, 
+                    GtColor color, float scale, int spacing);
+
+// Définit la transform courante pour les primitives suivantes dans le batch
+void gtBatchSetTransform(GtBatchRenderer* batch, const GtMat3* transform);
+
+// Push/pop transform dans le batch
+void gtBatchPushTransform(GtBatchRenderer* batch);
+void gtBatchPopTransform(GtBatchRenderer* batch);
+
+// Transform stack helpers (translation, rotation, scale)
+void gtBatchTranslate(GtBatchRenderer* batch, float tx, float ty);
+void gtBatchRotate(GtBatchRenderer* batch, float angle_rad);
+void gtBatchScale(GtBatchRenderer* batch, float sx, float sy);
+
+// Définit le scissor rect pour le batch
+void gtBatchSetScissorRect(GtBatchRenderer* batch, int x, int y, int w, int h);
+
+// Récupère les stats du batch (vertices utilisés, draw calls, etc.)
+typedef struct {
+    int vertices_used;
+    int max_vertices;
+    int flush_count;
+    int draw_calls;
+} GtBatchStats;
+void gtBatchGetStats(const GtBatchRenderer* batch, GtBatchStats* out_stats);
+
 /* =========================================================================
 * INPUT MAPPING (Actions → Bindings, Gamepad, Profils Joueur, Rebinding)
-* =========================================================================
-* Architecture :
+* ========================================================================= */
+/* Architecture :
 *   - Action : nom logique ("move_left", "jump", "shoot", "pause")
 *   - Binding : lien Action ←→ Entrée physique (touche, souris, gamepad btn/axis)
 *   - ActionMap : ensemble de bindings pour un contexte (gameplay, menu, UI)
@@ -1943,36 +2286,44 @@ int gtTimersUpdate(float dt) {
 * IMPLÉMENTATION : RENDERER ABSTRACTION (Backend GDI)
 * -------------------------------------------------------------------------
 * Structure interne du renderer (opaque pour l'utilisateur).
-* Contient le backend-specific data (champs réservés pour D2D).
 * Note: HDC n'est PAS stocké — obtenu via GetDC() à chaque frame dans gtRendererEnd
 *       pour éviter invalidation après WM_SIZE, changement DPI, veille, etc.
 * ------------------------------------------------------------------------- */
+#define GT_RENDERER_MAX_TRANSFORM_STACK 32
+#define GT_RENDERER_MAX_SCISSOR_STACK 32
+
+typedef struct GtRendererScissorState {
+    int x, y, w, h;
+    bool active;
+} GtRendererScissorState;
+
 struct GtRenderer {
     GtWindow* window;          // Fenêtre cible
-    GtRendererType type;       // Type de backend (GDI ou D2D)
-    // D2D-specific (réservé pour implémentation future)
-    void* d2d_factory;         // ID2D1Factory*
-    void* d2d_render_target;   // ID2D1HwndRenderTarget*
-    void* d2d_brush;           // ID2D1SolidColorBrush*
+    GtRendererType type;       // Type de backend (GDI)
+    
+    // Transform stack (model-view-projection matrix)
+    GtMat3 transform_stack[GT_RENDERER_MAX_TRANSFORM_STACK];
+    int transform_stack_depth; // 0 = identité (pas de transform)
+    
+    // Scissor/Clipping rect stack (en coordonnées écran)
+    GtRendererScissorState scissor_stack[GT_RENDERER_MAX_SCISSOR_STACK];
+    int scissor_stack_depth;
+    
+    // Caméra active (optionnelle)
+    GtCamera* camera;
 };
 
 // Crée un renderer pour une fenêtre
-// type : GT_RENDERER_GDI (recommandé, toujours dispo) ou GT_RENDERER_D2D (fallback GDI si indisponible)
+// type : GT_RENDERER_GDI
 GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type) {
     if (!window) return NULL;
+    (void)type;  // GDI est le backend unique de cette version.
 
     GtRenderer* renderer = (GtRenderer*)calloc(1, sizeof(GtRenderer));
     if (!renderer) return NULL;
 
     renderer->window = window;
-    renderer->type = (type == GT_RENDERER_D2D || type == GT_RENDERER_GDI)
-                   ? type : GT_RENDERER_GDI;
-
-    if (renderer->type == GT_RENDERER_D2D) {
-        // D2D non implémenté : fallback silencieux vers GDI.
-        renderer->type = GT_RENDERER_GDI;
-    }
-    // Pas de GetDC() ici — HDC obtenu à chaque frame dans gtRendererEnd
+    renderer->type = GT_RENDERER_GDI;
 
     return renderer;
 }
@@ -1980,213 +2331,1273 @@ GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type) {
 // Détruit le renderer et libère ses ressources
 void gtDestroyRenderer(GtRenderer* renderer) {
     if (!renderer) return;
-    // Pas de ReleaseDC() — HDC n'est pas stocké
     free(renderer);
 }
 
 // Début de frame : prépare le backend pour le dessin
 // GDI : rien à faire (dessine direct dans framebuffer RAM)
-// D2D futur : appellera ID2D1RenderTarget::BeginDraw()
 void gtRendererBegin(GtRenderer* renderer) {
-    (void)renderer;  // Évite warning "unused parameter" pour GDI
+    (void)renderer;  // Évite warning "unused parameter"
 }
 
 // Fin de frame : présente le résultat à l'écran
 // GDI : appelle gtUpdateWindow (GetDC/StretchDIBits/ReleaseDC à chaque frame)
-// D2D futur : EndDraw() + Present()
 void gtRendererEnd(GtRenderer* renderer) {
     if (!renderer || !renderer->window) return;
-
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtUpdateWindow(renderer->window);  // Unique point de blit (HDC frais à chaque appel)
-    }
-    // Pour D2D : EndDraw() + Present()
+    gtUpdateWindow(renderer->window);
 }
 
-// --- Primitives via le renderer ---
-// Le backend D2D est actuellement rabattu vers GDI dans gtCreateRenderer(),
-// donc toutes les opérations passent ici par le framebuffer CPU.
+
+// Helpers internes au renderer.
+static inline const GtMat3* gtRendererGetCurrentTransform(const GtRenderer* renderer);
+static inline GtVec2 gtRendererApplyTransform(const GtRenderer* renderer, GtVec2 v);
+static inline void gtRendererApplyTransformRect(const GtRenderer* renderer,
+                                                float x, float y, float w, float h,
+                                                float* out_x, float* out_y,
+                                                float* out_w, float* out_h);
+static inline bool gtRendererCheckScissor(const GtRenderer* renderer, int x, int y);
+static inline bool gtRendererClipRectScissor(const GtRenderer* renderer,
+                                             int* io_x, int* io_y,
+                                             int* io_w, int* io_h);
+static inline bool gtRendererClipLineScissor(const GtRenderer* renderer,
+                                             int* io_x1, int* io_y1,
+                                             int* io_x2, int* io_y2);
+
 void gtRendererClear(GtRenderer* renderer, GtColor color) {
     if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtClearWindow(renderer->window, color);
-    }
+    gtClearWindow(renderer->window, color);
 }
 
 void gtRendererDrawPixel(GtRenderer* renderer, int x, int y, GtColor color) {
     if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtDrawPixel(renderer->window, x, y, color);
+
+    GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)x, (float)y));
+    int px = (int)p.x;
+    int py = (int)p.y;
+
+    if (gtRendererCheckScissor(renderer, px, py)) {
+        gtDrawPixel(renderer->window, px, py, color);
     }
 }
 
 void gtRendererDrawRect(GtRenderer* renderer, int x, int y, int w, int h, GtColor color) {
-    if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtDrawRect(renderer->window, x, y, w, h, color);
+    if (!renderer || !renderer->window || w <= 0 || h <= 0) return;
+
+    float tx = (float)x;
+    float ty = (float)y;
+    float tw = (float)w;
+    float th = (float)h;
+    gtRendererApplyTransformRect(renderer, tx, ty, tw, th, &tx, &ty, &tw, &th);
+
+    int x1 = (int)tx;
+    int y1 = (int)ty;
+    int x2 = (int)(tx + tw);
+    int y2 = (int)(ty + th);
+
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 > renderer->window->width) x2 = renderer->window->width;
+    if (y2 > renderer->window->height) y2 = renderer->window->height;
+
+    int rect_w = x2 - x1;
+    int rect_h = y2 - y1;
+    if (rect_w <= 0 || rect_h <= 0) return;
+
+    if (!gtRendererClipRectScissor(renderer, &x1, &y1, &rect_w, &rect_h)) return;
+
+    x2 = x1 + rect_w;
+    y2 = y1 + rect_h;
+
+    for (int row = y1; row < y2; row++) {
+        size_t idx = (size_t)row * (size_t)renderer->window->width + (size_t)x1;
+        uint32_t* row_ptr = &renderer->window->buffer[idx];
+
+        if (((color >> 24) & 0xFFu) == 255u) {
+            uint32_t opaque = color | 0xFF000000u;
+            for (int col = 0; col < rect_w; col++) {
+                row_ptr[col] = opaque;
+            }
+        } else if (((color >> 24) & 0xFFu) != 0u) {
+            for (int col = 0; col < rect_w; col++) {
+                row_ptr[col] = gtBlendPixel(row_ptr[col], color);
+            }
+        }
     }
 }
 
 void gtRendererDrawRectLines(GtRenderer* renderer, int x, int y, int w, int h, GtColor color) {
-    if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtDrawRectLines(renderer->window, x, y, w, h, color);
+    if (!renderer || !renderer->window || w <= 0 || h <= 0) return;
+
+    float tx = (float)x;
+    float ty = (float)y;
+    float tw = (float)w;
+    float th = (float)h;
+    gtRendererApplyTransformRect(renderer, tx, ty, tw, th, &tx, &ty, &tw, &th);
+
+    int x1 = (int)tx;
+    int y1 = (int)ty;
+    int x2 = (int)(tx + tw) - 1;
+    int y2 = (int)(ty + th) - 1;
+
+    if (gtRendererCheckScissor(renderer, x1, y1) ||
+        gtRendererCheckScissor(renderer, x2, y1)) {
+        drawHLineClipped(renderer->window, y1, x1, x2, color);
+    }
+
+    if (y2 != y1 &&
+        (gtRendererCheckScissor(renderer, x1, y2) ||
+         gtRendererCheckScissor(renderer, x2, y2))) {
+        drawHLineClipped(renderer->window, y2, x1, x2, color);
+    }
+
+    if (gtRendererCheckScissor(renderer, x1, y1) ||
+        gtRendererCheckScissor(renderer, x1, y2)) {
+        drawVLineClipped(renderer->window, x1, y1 + 1, y2 - 1, color);
+    }
+
+    if (x2 != x1 &&
+        (gtRendererCheckScissor(renderer, x2, y1) ||
+         gtRendererCheckScissor(renderer, x2, y2))) {
+        drawVLineClipped(renderer->window, x2, y1 + 1, y2 - 1, color);
     }
 }
 
 void gtRendererDrawLine(GtRenderer* renderer, int x1, int y1, int x2, int y2, GtColor color) {
     if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtDrawLine(renderer->window, x1, y1, x2, y2, color);
+
+    GtVec2 p1 = gtRendererApplyTransform(renderer, gtVec2((float)x1, (float)y1));
+    GtVec2 p2 = gtRendererApplyTransform(renderer, gtVec2((float)x2, (float)y2));
+
+    int ix1 = (int)p1.x;
+    int iy1 = (int)p1.y;
+    int ix2 = (int)p2.x;
+    int iy2 = (int)p2.y;
+
+    if (!gtRendererClipLineScissor(renderer, &ix1, &iy1, &ix2, &iy2)) return;
+
+    if (clipLineSegment(&ix1, &iy1, &ix2, &iy2,
+                        renderer->window->width, renderer->window->height)) {
+        rasterizeBresenhamUnchecked(renderer->window, ix1, iy1, ix2, iy2, color);
     }
 }
 
 void gtRendererDrawCircle(GtRenderer* renderer, int cx, int cy, int radius, GtColor color) {
-    if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtDrawCircle(renderer->window, cx, cy, radius, color);
+    if (!renderer || !renderer->window || radius < 0) return;
+
+    GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)cx, (float)cy));
+    int tcx = (int)p.x;
+    int tcy = (int)p.y;
+
+    if (gtRendererCheckScissor(renderer, tcx, tcy)) {
+        gtDrawCircle(renderer->window, tcx, tcy, radius, color);
     }
 }
 
 void gtRendererDrawCircleLines(GtRenderer* renderer, int cx, int cy, int radius, GtColor color) {
-    if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtDrawCircleLines(renderer->window, cx, cy, radius, color);
+    if (!renderer || !renderer->window || radius < 0) return;
+
+    GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)cx, (float)cy));
+    int tcx = (int)p.x;
+    int tcy = (int)p.y;
+
+    if (gtRendererCheckScissor(renderer, tcx, tcy)) {
+        gtDrawCircleLines(renderer->window, tcx, tcy, radius, color);
     }
 }
 
-// Dessin de texte via renderer
-void gtRendererDrawText(GtRenderer* renderer, int x, int y, const char* text, GtColor color) {
-    if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtDrawText(renderer->window, x, y, text, color);
+/* =========================================================================
+ * IMPLÉMENTATION : TRANSFORMATIONS 2D VIA RENDERER
+ * ========================================================================= */
+
+// Helper interne : obtient la matrice courante (identité si stack vide)
+static inline const GtMat3* gtRendererGetCurrentTransform(const GtRenderer* renderer) {
+    if (!renderer || renderer->transform_stack_depth == 0) return NULL;
+    return &renderer->transform_stack[renderer->transform_stack_depth - 1];
+}
+
+// Helper interne : applique la transform courante à un point
+static inline GtVec2 gtRendererApplyTransform(const GtRenderer* renderer, GtVec2 v) {
+    const GtMat3* m = gtRendererGetCurrentTransform(renderer);
+    if (!m) return v;
+    return gtMat3MulVec2(*m, v);
+}
+
+// Helper interne : applique la transform courante à un rectangle et retourne son AABB
+static inline void gtRendererApplyTransformRect(const GtRenderer* renderer,
+                                                float x, float y, float w, float h,
+                                                float* out_x, float* out_y,
+                                                float* out_w, float* out_h) {
+    const GtMat3* m = gtRendererGetCurrentTransform(renderer);
+    if (!m) {
+        *out_x = x;
+        *out_y = y;
+        *out_w = w;
+        *out_h = h;
+        return;
+    }
+
+    GtVec2 corners[4] = {
+        gtMat3MulVec2(*m, gtVec2(x, y)),
+        gtMat3MulVec2(*m, gtVec2(x + w, y)),
+        gtMat3MulVec2(*m, gtVec2(x, y + h)),
+        gtMat3MulVec2(*m, gtVec2(x + w, y + h))
+    };
+
+    float min_x = corners[0].x;
+    float max_x = corners[0].x;
+    float min_y = corners[0].y;
+    float max_y = corners[0].y;
+
+    for (int i = 1; i < 4; i++) {
+        if (corners[i].x < min_x) min_x = corners[i].x;
+        if (corners[i].x > max_x) max_x = corners[i].x;
+        if (corners[i].y < min_y) min_y = corners[i].y;
+        if (corners[i].y > max_y) max_y = corners[i].y;
+    }
+
+    *out_x = min_x;
+    *out_y = min_y;
+    *out_w = max_x - min_x;
+    *out_h = max_y - min_y;
+}
+
+void gtRendererSetTransform(GtRenderer* renderer, const GtMat3* transform) {
+    if (!renderer) return;
+
+    if (renderer->transform_stack_depth == 0) {
+        if (!transform) return;
+        renderer->transform_stack[0] = *transform;
+        renderer->transform_stack_depth = 1;
+        return;
+    }
+
+    if (transform) {
+        renderer->transform_stack[renderer->transform_stack_depth - 1] = *transform;
+    } else {
+        renderer->transform_stack_depth = 0;
     }
 }
 
-void gtRendererDrawTextEx(GtRenderer* renderer, int x, int y, const char* text, GtColor color,
+const GtMat3* gtRendererGetTransform(const GtRenderer* renderer) {
+    return gtRendererGetCurrentTransform(renderer);
+}
+
+void gtRendererPushTransform(GtRenderer* renderer) {
+    if (!renderer) return;
+    if (renderer->transform_stack_depth >= GT_RENDERER_MAX_TRANSFORM_STACK) return;
+
+    if (renderer->transform_stack_depth == 0) {
+        renderer->transform_stack[0] = gtMat3Identity();
+    } else {
+        renderer->transform_stack[renderer->transform_stack_depth] =
+            renderer->transform_stack[renderer->transform_stack_depth - 1];
+    }
+
+    renderer->transform_stack_depth++;
+}
+
+void gtRendererPopTransform(GtRenderer* renderer) {
+    if (!renderer || renderer->transform_stack_depth == 0) return;
+    renderer->transform_stack_depth--;
+}
+
+void gtRendererMultiplyTransform(GtRenderer* renderer, const GtMat3* m) {
+    if (!renderer || !m) return;
+
+    if (renderer->transform_stack_depth == 0) {
+        gtRendererPushTransform(renderer);
+    }
+
+    GtMat3* current = &renderer->transform_stack[renderer->transform_stack_depth - 1];
+    *current = gtMat3Mul(*current, *m);
+}
+
+void gtRendererTranslate(GtRenderer* renderer, float tx, float ty) {
+    GtMat3 m = gtMat3Translate(tx, ty);
+    gtRendererMultiplyTransform(renderer, &m);
+}
+
+void gtRendererRotate(GtRenderer* renderer, float angle_rad) {
+    GtMat3 m = gtMat3Rotate(angle_rad);
+    gtRendererMultiplyTransform(renderer, &m);
+}
+
+void gtRendererScale(GtRenderer* renderer, float sx, float sy) {
+    GtMat3 m = gtMat3Scale(sx, sy);
+    gtRendererMultiplyTransform(renderer, &m);
+}
+
+void gtRendererSetCamera(GtRenderer* renderer, const GtCamera* camera) {
+    if (!renderer) return;
+
+    renderer->camera = (GtCamera*)camera;
+
+    if (camera) {
+        if (renderer->transform_stack_depth == 0) {
+            gtRendererPushTransform(renderer);
+        }
+        renderer->transform_stack[0] = camera->view_matrix;
+    } else {
+        renderer->transform_stack_depth = 0;
+    }
+}
+
+const GtCamera* gtRendererGetCamera(const GtRenderer* renderer) {
+    if (!renderer) return NULL;
+    return renderer->camera;
+}
+
+GtVec2 gtRendererWorldToScreen(const GtRenderer* renderer, GtVec2 world) {
+    if (!renderer) return world;
+
+    if (renderer->camera) {
+        return gtCameraWorldToScreen(renderer->camera, world);
+    }
+
+    return gtRendererApplyTransform(renderer, world);
+}
+
+GtVec2 gtRendererScreenToWorld(const GtRenderer* renderer, GtVec2 screen) {
+    if (!renderer) return screen;
+
+    if (renderer->camera) {
+        return gtCameraScreenToWorld(renderer->camera, screen);
+    }
+
+    const GtMat3* m = gtRendererGetCurrentTransform(renderer);
+    if (!m) return screen;
+
+    return gtMat3MulVec2(gtMat3Inverse(*m), screen);
+}
+
+/* =========================================================================
+ * IMPLÉMENTATION : SCISSOR / CLIPPING RECT
+ * ========================================================================= */
+
+void gtRendererSetScissorRect(GtRenderer* renderer, int x, int y, int w, int h) {
+    if (!renderer) return;
+
+    if (renderer->scissor_stack_depth == 0) {
+        renderer->scissor_stack[0].x = x;
+        renderer->scissor_stack[0].y = y;
+        renderer->scissor_stack[0].w = w;
+        renderer->scissor_stack[0].h = h;
+        renderer->scissor_stack[0].active = (w > 0 && h > 0);
+        renderer->scissor_stack_depth = 1;
+    } else {
+        GtRendererScissorState* scissor =
+            &renderer->scissor_stack[renderer->scissor_stack_depth - 1];
+
+        scissor->x = x;
+        scissor->y = y;
+        scissor->w = w;
+        scissor->h = h;
+        scissor->active = (w > 0 && h > 0);
+    }
+}
+
+void gtRendererPushScissorRect(GtRenderer* renderer, int x, int y, int w, int h) {
+    if (!renderer) return;
+    if (renderer->scissor_stack_depth >= GT_RENDERER_MAX_SCISSOR_STACK) return;
+
+    if (renderer->scissor_stack_depth > 0 &&
+        renderer->scissor_stack[renderer->scissor_stack_depth - 1].active) {
+
+        const GtRendererScissorState* parent =
+            &renderer->scissor_stack[renderer->scissor_stack_depth - 1];
+
+        int nx = (x > parent->x) ? x : parent->x;
+        int ny = (y > parent->y) ? y : parent->y;
+        int nx2 = (x + w < parent->x + parent->w) ? x + w : parent->x + parent->w;
+        int ny2 = (y + h < parent->y + parent->h) ? y + h : parent->y + parent->h;
+
+        GtRendererScissorState* child =
+            &renderer->scissor_stack[renderer->scissor_stack_depth];
+
+        if (nx2 <= nx || ny2 <= ny) {
+            child->x = 0;
+            child->y = 0;
+            child->w = 0;
+            child->h = 0;
+            child->active = false;
+        } else {
+            child->x = nx;
+            child->y = ny;
+            child->w = nx2 - nx;
+            child->h = ny2 - ny;
+            child->active = true;
+        }
+    } else {
+        GtRendererScissorState* child =
+            &renderer->scissor_stack[renderer->scissor_stack_depth];
+
+        child->x = x;
+        child->y = y;
+        child->w = w;
+        child->h = h;
+        child->active = (w > 0 && h > 0);
+    }
+
+    renderer->scissor_stack_depth++;
+}
+
+void gtRendererPopScissorRect(GtRenderer* renderer) {
+    if (!renderer || renderer->scissor_stack_depth == 0) return;
+    renderer->scissor_stack_depth--;
+}
+
+void gtRendererGetScissorRect(const GtRenderer* renderer,
+                              int* out_x, int* out_y,
+                              int* out_w, int* out_h) {
+    if (!renderer || renderer->scissor_stack_depth == 0 ||
+        !renderer->scissor_stack[renderer->scissor_stack_depth - 1].active) {
+
+        if (out_x) *out_x = 0;
+        if (out_y) *out_y = 0;
+        if (out_w) *out_w = renderer ? renderer->window->width : 0;
+        if (out_h) *out_h = renderer ? renderer->window->height : 0;
+        return;
+    }
+
+    const GtRendererScissorState* scissor =
+        &renderer->scissor_stack[renderer->scissor_stack_depth - 1];
+
+    if (out_x) *out_x = scissor->x;
+    if (out_y) *out_y = scissor->y;
+    if (out_w) *out_w = scissor->w;
+    if (out_h) *out_h = scissor->h;
+}
+
+static inline bool gtRendererCheckScissor(const GtRenderer* renderer, int x, int y) {
+    if (!renderer || renderer->scissor_stack_depth == 0) return true;
+
+    const GtRendererScissorState* scissor =
+        &renderer->scissor_stack[renderer->scissor_stack_depth - 1];
+
+    if (!scissor->active) return true;
+
+    return x >= scissor->x &&
+           x < scissor->x + scissor->w &&
+           y >= scissor->y &&
+           y < scissor->y + scissor->h;
+}
+
+static inline bool gtRendererClipRectScissor(const GtRenderer* renderer,
+                                             int* io_x, int* io_y,
+                                             int* io_w, int* io_h) {
+    if (!renderer || renderer->scissor_stack_depth == 0) return true;
+
+    const GtRendererScissorState* scissor =
+        &renderer->scissor_stack[renderer->scissor_stack_depth - 1];
+
+    if (!scissor->active) return true;
+
+    int x1 = *io_x;
+    int y1 = *io_y;
+    int x2 = x1 + *io_w;
+    int y2 = y1 + *io_h;
+
+    if (x2 <= scissor->x ||
+        x1 >= scissor->x + scissor->w ||
+        y2 <= scissor->y ||
+        y1 >= scissor->y + scissor->h) {
+        return false;
+    }
+
+    int clipped_x1 = (x1 > scissor->x) ? x1 : scissor->x;
+    int clipped_y1 = (y1 > scissor->y) ? y1 : scissor->y;
+    int clipped_x2 = (x2 < scissor->x + scissor->w) ? x2 : scissor->x + scissor->w;
+    int clipped_y2 = (y2 < scissor->y + scissor->h) ? y2 : scissor->y + scissor->h;
+
+    *io_x = clipped_x1;
+    *io_y = clipped_y1;
+    *io_w = clipped_x2 - clipped_x1;
+    *io_h = clipped_y2 - clipped_y1;
+
+    return *io_w > 0 && *io_h > 0;
+}
+
+static inline bool gtRendererClipLineScissor(const GtRenderer* renderer,
+                                             int* io_x1, int* io_y1,
+                                             int* io_x2, int* io_y2) {
+    if (!renderer || renderer->scissor_stack_depth == 0) return true;
+
+    const GtRendererScissorState* scissor =
+        &renderer->scissor_stack[renderer->scissor_stack_depth - 1];
+
+    if (!scissor->active) return true;
+
+    int x1 = *io_x1 - scissor->x;
+    int y1 = *io_y1 - scissor->y;
+    int x2 = *io_x2 - scissor->x;
+    int y2 = *io_y2 - scissor->y;
+
+    if (!clipLineSegment(&x1, &y1, &x2, &y2, scissor->w, scissor->h)) {
+        return false;
+    }
+
+    *io_x1 = x1 + scissor->x;
+    *io_y1 = y1 + scissor->y;
+    *io_x2 = x2 + scissor->x;
+    *io_y2 = y2 + scissor->y;
+    return true;
+}
+
+void gtRendererDrawText(GtRenderer* renderer, int x, int y,
+                        const char* text, GtColor color) {
+    if (!renderer || !renderer->window || !text) return;
+
+    GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)x, (float)y));
+    gtDrawText(renderer->window, (int)p.x, (int)p.y, text, color);
+}
+
+void gtRendererDrawTextEx(GtRenderer* renderer, int x, int y,
+                          const char* text, GtColor color,
                           float scale, int spacing, int wrap_width) {
-    if (!renderer || !renderer->window) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        gtDrawTextEx(renderer->window, x, y, text, color, scale, spacing, wrap_width);
+    if (!renderer || !renderer->window || !text) return;
+
+    GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)x, (float)y));
+    gtDrawTextEx(renderer->window, (int)p.x, (int)p.y, text, color,
+                 scale, spacing, wrap_width);
+}
+
+void gtRendererDrawImage(GtRenderer* renderer, GtImage* image,
+                         int x, int y, GtColor tint) {
+    if (!renderer || !renderer->window || !image) return;
+
+    int img_w = gtImageGetWidth(image);
+    int img_h = gtImageGetHeight(image);
+    uint32_t* img_pixels = gtImageGetPixels(image);
+    if (!img_pixels || img_w <= 0 || img_h <= 0) return;
+
+    float tx = (float)x;
+    float ty = (float)y;
+    float tw = (float)img_w;
+    float th = (float)img_h;
+    gtRendererApplyTransformRect(renderer, tx, ty, tw, th, &tx, &ty, &tw, &th);
+
+    GtWindow* win = renderer->window;
+
+    int x1 = (int)tx;
+    int y1 = (int)ty;
+    int x2 = (int)(tx + tw);
+    int y2 = (int)(ty + th);
+
+    int clipped_w = x2 - x1;
+    int clipped_h = y2 - y1;
+    if (clipped_w <= 0 || clipped_h <= 0) return;
+
+    if (!gtRendererClipRectScissor(renderer,
+                                   &x1, &y1, &clipped_w, &clipped_h)) {
+        return;
+    }
+
+    int screen_x1 = x1;
+    int screen_y1 = y1;
+    int screen_x2 = x1 + clipped_w;
+    int screen_y2 = y1 + clipped_h;
+
+    if (screen_x1 < 0) {
+        int delta = -screen_x1;
+        screen_x1 = 0;
+        clipped_w -= delta;
+    }
+    if (screen_y1 < 0) {
+        int delta = -screen_y1;
+        screen_y1 = 0;
+        clipped_h -= delta;
+    }
+    if (screen_x2 > win->width) {
+        clipped_w -= screen_x2 - win->width;
+        screen_x2 = win->width;
+    }
+    if (screen_y2 > win->height) {
+        clipped_h -= screen_y2 - win->height;
+        screen_y2 = win->height;
+    }
+
+    if (clipped_w <= 0 || clipped_h <= 0) return;
+
+    int src_x1 = screen_x1 - (int)tx;
+    int src_y1 = screen_y1 - (int)ty;
+
+    if (src_x1 < 0) src_x1 = 0;
+    if (src_y1 < 0) src_y1 = 0;
+    if (src_x1 >= img_w || src_y1 >= img_h) return;
+
+    uint8_t tint_a = (uint8_t)((tint >> 24) & 0xFFu);
+    if (tint_a == 0) return;
+
+    for (int row = 0; row < clipped_h; row++) {
+        int dst_y = screen_y1 + row;
+        int src_y = src_y1 + row;
+        if (src_y < 0 || src_y >= img_h) continue;
+
+        uint32_t* dst_row =
+            &win->buffer[(size_t)dst_y * (size_t)win->width + (size_t)screen_x1];
+        uint32_t* src_row =
+            &img_pixels[(size_t)src_y * (size_t)img_w + (size_t)src_x1];
+
+        for (int col = 0; col < clipped_w; col++) {
+            uint32_t src = src_row[col];
+            uint8_t sa = (uint8_t)((src >> 24) & 0xFFu);
+            if (sa == 0) continue;
+
+            if (tint_a != 255) {
+                uint32_t sr = ((src >> 16) & 0xFFu) * ((tint >> 16) & 0xFFu) / 255u;
+                uint32_t sg = ((src >> 8) & 0xFFu) * ((tint >> 8) & 0xFFu) / 255u;
+                uint32_t sb = (src & 0xFFu) * (tint & 0xFFu) / 255u;
+                src = ((uint32_t)sa << 24) | (sr << 16) | (sg << 8) | sb;
+            }
+
+            dst_row[col] = (sa == 255 && tint_a == 255)
+                ? (src | 0xFF000000u)
+                : gtBlendPixel(dst_row[col], src);
+        }
     }
 }
 
-// Dessin d'image via renderer
-void gtRendererDrawImage(GtRenderer* renderer, GtImage* image, int x, int y, GtColor tint) {
-    if (!renderer || !renderer->window || !image) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        // Pour GDI, on blit directement les pixels de l'image
-        int img_w = gtImageGetWidth(image);
-        int img_h = gtImageGetHeight(image);
-        uint32_t* img_pixels = gtImageGetPixels(image);
-        if (!img_pixels) return;
+void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
+                           int x, int y, int w, int h,
+                           float rot, GtVec2 origin,
+                           bool flip_x, bool flip_y, GtColor tint) {
+    /* GDI renderer actuel : rotation/origine/flip ne sont pas encore rasterisés. */
+    (void)rot;
+    (void)origin;
+    (void)flip_x;
+    (void)flip_y;
 
-        GtWindow* win = renderer->window;
-        // Clipping
-        int x1 = x < 0 ? 0 : x;
-        int y1 = y < 0 ? 0 : y;
-        int x2 = (x + img_w > win->width) ? win->width : x + img_w;
-        int y2 = (y + img_h > win->height) ? win->height : y + img_h;
+    if (!renderer || !renderer->window || !image || w <= 0 || h <= 0) return;
 
-        int src_x1 = x1 - x;
-        int src_y1 = y1 - y;
+    int img_w = gtImageGetWidth(image);
+    int img_h = gtImageGetHeight(image);
+    uint32_t* img_pixels = gtImageGetPixels(image);
+    if (!img_pixels || img_w <= 0 || img_h <= 0) return;
 
-        if (x1 >= x2 || y1 >= y2) return;
+    float tx = (float)x;
+    float ty = (float)y;
+    float tw = (float)w;
+    float th = (float)h;
+    gtRendererApplyTransformRect(renderer, tx, ty, tw, th, &tx, &ty, &tw, &th);
 
-        size_t stride = (size_t)win->width;
-        size_t img_stride = (size_t)img_w;
+    if (tw <= 0.0f || th <= 0.0f) return;
 
-        // Alpha blending simple
-        uint8_t ta = (tint >> 24) & 0xFFu;
-        if (ta == 0) return; // Invisible
+    GtWindow* win = renderer->window;
 
-        for (int row = y1; row < y2; row++) {
-            uint32_t* dst_row = &win->buffer[(size_t)row * stride + (size_t)x1];
-            uint32_t* src_row = &img_pixels[(size_t)(src_y1 + row - y1) * img_stride + (size_t)src_x1];
-            int count = x2 - x1;
+    int x1 = (int)tx;
+    int y1 = (int)ty;
+    int clipped_w = (int)tw;
+    int clipped_h = (int)th;
 
-            if (ta == 255) {
-                // Pas de teinte, copie directe avec blend sur fond
-                for (int col = 0; col < count; col++) {
-                    uint32_t src = src_row[col];
-                    uint32_t sa = (src >> 24) & 0xFFu;
-                    if (sa == 255) {
-                        dst_row[col] = src | 0xFF000000u;
-                    } else if (sa > 0) {
-                        dst_row[col] = gtBlendPixel(dst_row[col], src);
+    if (clipped_w <= 0 || clipped_h <= 0) return;
+
+    if (!gtRendererClipRectScissor(renderer, &x1, &y1, &clipped_w, &clipped_h)) {
+        return;
+    }
+
+    int screen_x1 = x1;
+    int screen_y1 = y1;
+
+    if (screen_x1 < 0) {
+        int delta = -screen_x1;
+        screen_x1 = 0;
+        clipped_w -= delta;
+    }
+    if (screen_y1 < 0) {
+        int delta = -screen_y1;
+        screen_y1 = 0;
+        clipped_h -= delta;
+    }
+    if (screen_x1 + clipped_w > win->width) {
+        clipped_w = win->width - screen_x1;
+    }
+    if (screen_y1 + clipped_h > win->height) {
+        clipped_h = win->height - screen_y1;
+    }
+
+    if (clipped_w <= 0 || clipped_h <= 0) return;
+
+    uint8_t tint_a = (uint8_t)((tint >> 24) & 0xFFu);
+    if (tint_a == 0) return;
+
+    for (int dy = 0; dy < clipped_h; dy++) {
+        int dst_y = screen_y1 + dy;
+        float src_frac_y = (float)(dy + (screen_y1 - (int)ty)) / th;
+        int src_y = (int)(src_frac_y * (float)img_h);
+        if (src_y < 0) src_y = 0;
+        if (src_y >= img_h) src_y = img_h - 1;
+
+        uint32_t* dst_row =
+            &win->buffer[(size_t)dst_y * (size_t)win->width];
+
+        for (int dx = 0; dx < clipped_w; dx++) {
+            int dst_x = screen_x1 + dx;
+            float src_frac_x = (float)(dx + (screen_x1 - (int)tx)) / tw;
+            int src_x = (int)(src_frac_x * (float)img_w);
+            if (src_x < 0) src_x = 0;
+            if (src_x >= img_w) src_x = img_w - 1;
+
+            uint32_t src =
+                img_pixels[(size_t)src_y * (size_t)img_w + (size_t)src_x];
+            uint8_t sa = (uint8_t)((src >> 24) & 0xFFu);
+            if (sa == 0) continue;
+
+            if (tint_a != 255) {
+                uint32_t sr = ((src >> 16) & 0xFFu) * ((tint >> 16) & 0xFFu) / 255u;
+                uint32_t sg = ((src >> 8) & 0xFFu) * ((tint >> 8) & 0xFFu) / 255u;
+                uint32_t sb = (src & 0xFFu) * (tint & 0xFFu) / 255u;
+                src = ((uint32_t)sa << 24) | (sr << 16) | (sg << 8) | sb;
+            }
+
+            dst_row[(size_t)dst_x] = gtBlendPixel(dst_row[(size_t)dst_x], src);
+        }
+    }
+}
+
+void gtRendererDrawImageTransformed(GtRenderer* renderer,
+                                    GtImage* image,
+                                    const GtMat3* model,
+                                    GtColor tint) {
+    if (!renderer || !renderer->window || !image || !model) return;
+
+    int img_w = gtImageGetWidth(image);
+    int img_h = gtImageGetHeight(image);
+    if (img_w <= 0 || img_h <= 0) return;
+
+    GtVec2 corners[4] = {
+        gtMat3MulVec2(*model, gtVec2(0.0f, 0.0f)),
+        gtMat3MulVec2(*model, gtVec2((float)img_w, 0.0f)),
+        gtMat3MulVec2(*model, gtVec2(0.0f, (float)img_h)),
+        gtMat3MulVec2(*model, gtVec2((float)img_w, (float)img_h))
+    };
+
+    float min_x = corners[0].x;
+    float max_x = corners[0].x;
+    float min_y = corners[0].y;
+    float max_y = corners[0].y;
+
+    for (int i = 1; i < 4; i++) {
+        if (corners[i].x < min_x) min_x = corners[i].x;
+        if (corners[i].x > max_x) max_x = corners[i].x;
+        if (corners[i].y < min_y) min_y = corners[i].y;
+        if (corners[i].y > max_y) max_y = corners[i].y;
+    }
+
+    gtRendererDrawImageEx(renderer, image,
+                          (int)min_x, (int)min_y,
+                          (int)(max_x - min_x), (int)(max_y - min_y),
+                          0.0f, gtVec2(0.0f, 0.0f),
+                          false, false, tint);
+}
+
+/* =========================================================================
+* IMPLÉMENTATION : BATCH RENDERING (2.1)
+* ========================================================================= */
+
+#define GT_BATCH_MAX_TRANSFORM_STACK 32
+#define GT_BATCH_MAX_SCISSOR_STACK 32
+
+typedef struct GtBatchScissorState {
+    int x, y, w, h;
+    bool active;
+} GtBatchScissorState;
+
+struct GtBatchRenderer {
+    GtRenderer* renderer;           // Renderer parent
+    GtBatchConfig config;           // Configuration
+    
+    // Vertex buffer
+    GtBatchVertex* vertices;        // Buffer de vertices
+    int vertex_count;               // Nombre de vertices utilisés
+    int vertex_capacity;            // Capacité du buffer
+    
+    // Images référencées dans ce batch
+    GtImage** images;               // Tableau d'images (max_images)
+    int image_count;                // Nombre d'images
+    
+    // Transform stack
+    GtMat3 transform_stack[GT_BATCH_MAX_TRANSFORM_STACK];
+    int transform_stack_depth;
+    
+    // Scissor stack
+    GtBatchScissorState scissor_stack[GT_BATCH_MAX_SCISSOR_STACK];
+    int scissor_stack_depth;
+    
+    // Stats
+    int flush_count;
+    int draw_calls;
+    
+    // État
+    bool began;                     // gtBatchBegin appelé
+};
+
+static inline const GtMat3* gtBatchGetCurrentTransform(const GtBatchRenderer* batch) {
+    if (!batch || batch->transform_stack_depth == 0) return NULL;
+    return &batch->transform_stack[batch->transform_stack_depth - 1];
+}
+
+static inline GtVec2 gtBatchApplyTransform(const GtBatchRenderer* batch, GtVec2 v) {
+    const GtMat3* m = gtBatchGetCurrentTransform(batch);
+    if (!m) return v;
+    return gtMat3MulVec2(*m, v);
+}
+
+static inline void gtBatchApplyTransformRect(const GtBatchRenderer* batch, float x, float y, float w, float h, 
+                                             float* out_x, float* out_y, float* out_w, float* out_h) {
+    const GtMat3* m = gtBatchGetCurrentTransform(batch);
+    if (!m) {
+        *out_x = x; *out_y = y; *out_w = w; *out_h = h;
+        return;
+    }
+    GtVec2 corners[4] = {
+        gtMat3MulVec2(*m, gtVec2(x, y)),
+        gtMat3MulVec2(*m, gtVec2(x + w, y)),
+        gtMat3MulVec2(*m, gtVec2(x, y + h)),
+        gtMat3MulVec2(*m, gtVec2(x + w, y + h))
+    };
+    float min_x = corners[0].x, max_x = corners[0].x;
+    float min_y = corners[0].y, max_y = corners[0].y;
+    for (int i = 1; i < 4; i++) {
+        if (corners[i].x < min_x) min_x = corners[i].x;
+        if (corners[i].x > max_x) max_x = corners[i].x;
+        if (corners[i].y < min_y) min_y = corners[i].y;
+        if (corners[i].y > max_y) max_y = corners[i].y;
+    }
+    *out_x = min_x; *out_y = min_y; *out_w = max_x - min_x; *out_h = max_y - min_y;
+}
+
+static inline int gtBatchGetImageId(GtBatchRenderer* batch, GtImage* image) {
+    if (!image) return -1;
+    for (int i = 0; i < batch->image_count; i++) {
+        if (batch->images[i] == image) return i;
+    }
+    if (batch->image_count < batch->config.max_images) {
+        batch->images[batch->image_count++] = image;
+        return batch->image_count - 1;
+    }
+    return -1; // Plus de place pour images
+}
+
+static inline bool gtBatchCheckScissor(const GtBatchRenderer* batch, int x, int y) {
+    if (!batch || batch->scissor_stack_depth == 0) return true;
+    const GtBatchScissorState* s = &batch->scissor_stack[batch->scissor_stack_depth - 1];
+    if (!s->active) return true;
+    return x >= s->x && x < s->x + s->w && y >= s->y && y < s->y + s->h;
+}
+
+static inline bool gtBatchClipRectScissor(const GtBatchRenderer* batch, int* io_x, int* io_y, int* io_w, int* io_h) {
+    if (!batch || batch->scissor_stack_depth == 0) return true;
+    const GtBatchScissorState* s = &batch->scissor_stack[batch->scissor_stack_depth - 1];
+    if (!s->active) return true;
+    
+    int x1 = *io_x;
+    int y1 = *io_y;
+    int x2 = *io_x + *io_w;
+    int y2 = *io_y + *io_h;
+    
+    if (x2 <= s->x || x1 >= s->x + s->w || y2 <= s->y || y1 >= s->y + s->h) return false;
+    
+    if (x1 < s->x) { *io_w -= s->x - x1; x1 = s->x; }
+    if (y1 < s->y) { *io_h -= s->y - y1; y1 = s->y; }
+    if (x2 > s->x + s->w) { *io_w = s->x + s->w - x1; }
+    if (y2 > s->y + s->h) { *io_h = s->y + s->h - y1; }
+    
+    *io_x = x1; *io_y = y1;
+    return *io_w > 0 && *io_h > 0;
+}
+
+static inline void gtBatchEnsureCapacity(GtBatchRenderer* batch, int needed) {
+    if (batch->vertex_count + needed > batch->vertex_capacity) {
+        if (batch->config.auto_flush) {
+            gtBatchFlush(batch);
+        } else {
+            // Grow buffer
+            int new_cap = batch->vertex_capacity * 2;
+            if (new_cap < batch->vertex_count + needed) new_cap = batch->vertex_count + needed;
+            GtBatchVertex* new_vertices = (GtBatchVertex*)realloc(batch->vertices, (size_t)new_cap * sizeof(GtBatchVertex));
+            if (new_vertices) {
+                batch->vertices = new_vertices;
+                batch->vertex_capacity = new_cap;
+            }
+        }
+    }
+}
+
+static void gtBatchAddVertex(GtBatchRenderer* batch, GtBatchVertex v) {
+    if (batch->vertex_count < batch->vertex_capacity) {
+        batch->vertices[batch->vertex_count++] = v;
+    }
+}
+
+// Rasterise un rectangle en vertices (2 triangles = 6 vertices)
+static void gtBatchEmitRect(GtBatchRenderer* batch, float x, float y, float w, float h, GtColor color, int image_id, float u0, float v0, float u1, float v1) {
+    GtBatchVertex v[6];
+    // Triangle 1: (x,y) (x+w,y) (x,y+h)
+    v[0] = (GtBatchVertex){ x, y, u0, v0, color, 0, image_id, GT_BATCH_RECT, {0} };
+    v[1] = (GtBatchVertex){ x + w, y, u1, v0, color, 0, image_id, GT_BATCH_RECT, {0} };
+    v[2] = (GtBatchVertex){ x, y + h, u0, v1, color, 0, image_id, GT_BATCH_RECT, {0} };
+    // Triangle 2: (x+w,y) (x+w,y+h) (x,y+h)
+    v[3] = (GtBatchVertex){ x + w, y, u1, v0, color, 0, image_id, GT_BATCH_RECT, {0} };
+    v[4] = (GtBatchVertex){ x + w, y + h, u1, v1, color, 0, image_id, GT_BATCH_RECT, {0} };
+    v[5] = (GtBatchVertex){ x, y + h, u0, v1, color, 0, image_id, GT_BATCH_RECT, {0} };
+    
+    gtBatchEnsureCapacity(batch, 6);
+    for (int i = 0; i < 6; i++) gtBatchAddVertex(batch, v[i]);
+}
+
+// Rasterise un cercle en vertices (triangle fan)
+static void gtBatchEmitCircle(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color, int segments) {
+    if (segments < 3) segments = 16;
+    if (segments > 64) segments = 64;
+    
+    gtBatchEnsureCapacity(batch, (segments + 2) * 3); // Max vertices for triangle fan
+    
+    // Centre
+    GtBatchVertex center = { cx, cy, 0, 0, color, radius, -1, GT_BATCH_CIRCLE, {0} };
+    gtBatchAddVertex(batch, center);
+    
+    // Périphérie
+    for (int i = 0; i <= segments; i++) {
+        float angle = (float)i / segments * 2.0f * 3.14159265359f;
+        float x = cx + cosf(angle) * radius;
+        float y = cy + sinf(angle) * radius;
+        GtBatchVertex v = { x, y, 0, 0, color, radius, -1, GT_BATCH_CIRCLE, {0} };
+        gtBatchAddVertex(batch, v);
+    }
+}
+
+// Rasterise une ligne en vertices (quad épais = 4 vertices)
+static void gtBatchEmitLine(GtBatchRenderer* batch, float x1, float y1, float x2, float y2, GtColor color) {
+    // Pour ligne simple, on émet un quad fin (2 triangles)
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float len = sqrtf(dx*dx + dy*dy);
+    if (len < 0.001f) return;
+    
+    // Normalisée perpendiculaire pour épaisseur
+    float nx = -dy / len * 0.5f;
+    float ny = dx / len * 0.5f;
+    
+    GtBatchVertex v[4];
+    v[0] = (GtBatchVertex){ x1 + nx, y1 + ny, 0, 0, color, 0, -1, GT_BATCH_LINE, {0} };
+    v[1] = (GtBatchVertex){ x1 - nx, y1 - ny, 0, 0, color, 0, -1, GT_BATCH_LINE, {0} };
+    v[2] = (GtBatchVertex){ x2 + nx, y2 + ny, 0, 0, color, 0, -1, GT_BATCH_LINE, {0} };
+    v[3] = (GtBatchVertex){ x2 - nx, y2 - ny, 0, 0, color, 0, -1, GT_BATCH_LINE, {0} };
+    
+    gtBatchEnsureCapacity(batch, 4);
+    for (int i = 0; i < 4; i++) gtBatchAddVertex(batch, v[i]);
+}
+
+GtBatchRenderer* gtBatchCreate(GtRenderer* renderer, const GtBatchConfig* config) {
+    if (!renderer) return NULL;
+    
+    GtBatchConfig cfg = { 65536, 256, true };
+    if (config) cfg = *config;
+    if (cfg.max_vertices <= 0) cfg.max_vertices = 65536;
+    if (cfg.max_images <= 0) cfg.max_images = 256;
+    
+    GtBatchRenderer* batch = (GtBatchRenderer*)calloc(1, sizeof(GtBatchRenderer));
+    if (!batch) return NULL;
+    
+    batch->renderer = renderer;
+    batch->config = cfg;
+    batch->vertex_capacity = cfg.max_vertices;
+    batch->vertices = (GtBatchVertex*)malloc((size_t)cfg.max_vertices * sizeof(GtBatchVertex));
+    batch->images = (GtImage**)malloc((size_t)cfg.max_images * sizeof(GtImage*));
+    
+    if (!batch->vertices || !batch->images) {
+        gtBatchDestroy(batch);
+        return NULL;
+    }
+    
+    return batch;
+}
+
+void gtBatchDestroy(GtBatchRenderer* batch) {
+    if (!batch) return;
+    free(batch->vertices);
+    free(batch->images);
+    free(batch);
+}
+
+void gtBatchBegin(GtBatchRenderer* batch) {
+    if (!batch || batch->began) return;
+    batch->vertex_count = 0;
+    batch->image_count = 0;
+    batch->transform_stack_depth = 0;
+    batch->scissor_stack_depth = 0;
+    batch->flush_count = 0;
+    batch->draw_calls = 0;
+    batch->began = true;
+}
+
+void gtBatchEnd(GtBatchRenderer* batch) {
+    if (!batch || !batch->began) return;
+    gtBatchFlush(batch);
+    batch->began = false;
+}
+
+void gtBatchFlush(GtBatchRenderer* batch) {
+    if (!batch || !batch->began || batch->vertex_count == 0) return;
+    
+    GtRenderer* r = batch->renderer;
+    if (!r || r->type != GT_RENDERER_GDI) return;
+    
+    GtWindow* win = r->window;
+    if (!win) return;
+    
+    // Pour GDI : on parcourt les vertices et on dessine directement
+    // GDI : le batching parcourt les primitives côté CPU.
+    batch->draw_calls = 0;
+    
+    // Tri par image_id pour minimiser les changements de texture
+    // (Pour l'instant, on dessine dans l'ordre - optimisable)
+    
+    for (int i = 0; i < batch->vertex_count; ) {
+        GtBatchVertex* v = &batch->vertices[i];
+        GtImage* img = (v->image_id >= 0 && v->image_id < batch->image_count) ? batch->images[v->image_id] : NULL;
+        
+        switch (v->prim_type) {
+            case GT_BATCH_RECT: {
+                // 6 vertices = 2 triangles = 1 rect
+                if (i + 5 < batch->vertex_count) {
+                    float x = v[0].x;
+                    float y = v[0].y;
+                    float w = v[1].x - v[0].x;
+                    float h = v[2].y - v[0].y;
+                    
+                    // Clip contre fenêtre
+                    int ix = (int)x; if (ix < 0) ix = 0;
+                    int iy = (int)y; if (iy < 0) iy = 0;
+                    int iw = (int)w; if (ix + iw > win->width) iw = win->width - ix;
+                    int ih = (int)h; if (iy + ih > win->height) ih = win->height - iy;
+                    
+                    if (iw > 0 && ih > 0 && gtBatchClipRectScissor(batch, &ix, &iy, &iw, &ih)) {
+                        if (img) {
+                            // Draw image rect (simplified)
+                            gtRendererDrawImageEx(r, img, ix, iy, iw, ih, 0.0f, gtVec2(0, 0), false, false, v[0].color);
+                        } else {
+                            // Draw filled rect
+                            for (int row = iy; row < iy + ih; row++) {
+                                size_t idx = (size_t)row * (size_t)win->width + (size_t)ix;
+                                uint32_t* row_ptr = &win->buffer[idx];
+                                for (int col = 0; col < iw; col++) {
+                                    row_ptr[col] = (v[0].color >> 24 == 255) ? (v[0].color | 0xFF000000u) : gtBlendPixel(row_ptr[col], v[0].color);
+                                }
+                            }
+                        }
                     }
                 }
-            } else {
-                // Avec teinte multiplicative
-                for (int col = 0; col < count; col++) {
-                    uint32_t src = src_row[col];
-                    uint32_t sa = (src >> 24) & 0xFFu;
-                    if (sa == 0) continue;
-
-                    // Applique teinte sur la source
-                    uint32_t sr = ((src >> 16) & 0xFFu) * ((tint >> 16) & 0xFFu) / 255;
-                    uint32_t sg = ((src >> 8) & 0xFFu) * ((tint >> 8) & 0xFFu) / 255;
-                    uint32_t sb = (src & 0xFFu) * (tint & 0xFFu) / 255;
-                    uint32_t blended_src = (sa << 24) | (sr << 16) | (sg << 8) | sb;
-
-                    dst_row[col] = gtBlendPixel(dst_row[col], blended_src);
-                }
+                i += 6;
+                batch->draw_calls++;
+                break;
             }
+            case GT_BATCH_CIRCLE: {
+                // Triangle fan: center + perimeter vertices
+                int segments = 0;
+                for (int j = i + 1; j < batch->vertex_count && batch->vertices[j].prim_type == GT_BATCH_CIRCLE; j++) segments++;
+                if (segments >= 3) {
+                    // Draw as filled circle using existing function (center is first vertex)
+                    int cx = (int)v[0].x;
+                    int cy = (int)v[0].y;
+                    int radius = (int)v[0].radius;
+                    if (gtBatchCheckScissor(batch, cx - radius, cy - radius)) {
+                        gtDrawCircle(win, cx, cy, radius, v[0].color);
+                    }
+                }
+                i += segments + 1;
+                batch->draw_calls++;
+                break;
+            }
+            case GT_BATCH_LINE: {
+                if (i + 3 < batch->vertex_count) {
+                    int x1 = (int)v[0].x, y1 = (int)v[0].y;
+                    int x2 = (int)v[2].x, y2 = (int)v[2].y; // Opposite corner of quad
+                    gtDrawLine(win, x1, y1, x2, y2, v[0].color);
+                }
+                i += 4;
+                batch->draw_calls++;
+                break;
+            }
+            default:
+                i++;
+                break;
+        }
+    }
+    
+    batch->vertex_count = 0;
+    batch->image_count = 0;
+    batch->flush_count++;
+}
+
+void gtBatchAddRect(GtBatchRenderer* batch, float x, float y, float w, float h, GtColor color) {
+    if (!batch || !batch->began || w <= 0 || h <= 0) return;
+    float tx = x, ty = y, tw = w, th = h;
+    gtBatchApplyTransformRect(batch, tx, ty, tw, th, &tx, &ty, &tw, &th);
+    gtBatchEmitRect(batch, tx, ty, tw, th, color, -1, 0, 0, 1, 1);
+}
+
+void gtBatchAddRectLines(GtBatchRenderer* batch, float x, float y, float w, float h, GtColor color) {
+    if (!batch || !batch->began || w <= 0 || h <= 0) return;
+    // Emit as 4 lines for now
+    gtBatchAddLine(batch, x, y, x + w, y, color);
+    gtBatchAddLine(batch, x + w, y, x + w, y + h, color);
+    gtBatchAddLine(batch, x + w, y + h, x, y + h, color);
+    gtBatchAddLine(batch, x, y + h, x, y, color);
+}
+
+void gtBatchAddLine(GtBatchRenderer* batch, float x1, float y1, float x2, float y2, GtColor color) {
+    if (!batch || !batch->began) return;
+    GtVec2 p1 = gtBatchApplyTransform(batch, gtVec2(x1, y1));
+    GtVec2 p2 = gtBatchApplyTransform(batch, gtVec2(x2, y2));
+    gtBatchEmitLine(batch, p1.x, p1.y, p2.x, p2.y, color);
+}
+
+void gtBatchAddCircle(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color) {
+    if (!batch || !batch->began || radius <= 0) return;
+    GtVec2 p = gtBatchApplyTransform(batch, gtVec2(cx, cy));
+    gtBatchEmitCircle(batch, p.x, p.y, radius, color, 16);
+}
+
+void gtBatchAddCircleLines(GtBatchRenderer* batch, float cx, float cy, float radius, GtColor color) {
+    if (!batch || !batch->began || radius <= 0) return;
+    // Pour l'instant, même chose que filled (à améliorer avec line loop)
+    gtBatchAddCircle(batch, cx, cy, radius, color);
+}
+
+void gtBatchAddImage(GtBatchRenderer* batch, GtImage* image, float x, float y, 
+                     float w, float h, GtColor tint,
+                     float u0, float v0, float u1, float v1,
+                     GtVec2 origin, float rot, float scale) {
+    if (!batch || !batch->began || !image || w <= 0 || h <= 0) return;
+    
+    // Applique origin
+    float ox = x - origin.x * w * scale;
+    float oy = y - origin.y * h * scale;
+    float tw = w * scale;
+    float th = h * scale;
+    
+    // Applique rotation via transform stack (simplifié: rotation autour du centre)
+    if (rot != 0.0f) {
+        gtBatchPushTransform(batch);
+        gtBatchTranslate(batch, ox + tw * 0.5f, oy + th * 0.5f);
+        gtBatchRotate(batch, rot);
+        gtBatchTranslate(batch, -tw * 0.5f, -th * 0.5f);
+    }
+    
+    int img_id = gtBatchGetImageId(batch, image);
+    float tx = ox, ty = oy, ttw = tw, tth = th;
+    gtBatchApplyTransformRect(batch, tx, ty, ttw, tth, &tx, &ty, &ttw, &tth);
+    
+    if (rot != 0.0f) {
+        gtBatchPopTransform(batch);
+    }
+    
+    gtBatchEmitRect(batch, tx, ty, ttw, tth, tint, img_id, u0, v0, u1, v1);
+}
+
+void gtBatchAddText(GtBatchRenderer* batch, const char* text, float x, float y, 
+                    GtColor color, float scale, int spacing) {
+    if (!batch || !batch->began || !text) return;
+    
+    GtVec2 p = gtBatchApplyTransform(batch, gtVec2(x, y));
+    int char_w = (int)(8 * scale);
+    int cur_x = (int)p.x;
+    int cur_y = (int)p.y;
+    
+    for (const char* c = text; *c; c++) {
+        if (*c == '\n') {
+            cur_x = (int)p.x;
+            cur_y += (int)(8 * scale) + spacing;
+            continue;
+        }
+        if (*c < 32 || *c > 126) continue;
+        
+        // Pour le texte, on émet un rect par caractère
+        gtBatchEmitRect(batch, (float)cur_x, (float)cur_y, (float)char_w, (float)(8 * scale), color, -1, 0, 0, 1, 1);
+        cur_x += char_w + spacing;
+    }
+}
+
+void gtBatchSetTransform(GtBatchRenderer* batch, const GtMat3* transform) {
+    if (!batch) return;
+    if (batch->transform_stack_depth == 0) {
+        if (transform) {
+            batch->transform_stack[0] = *transform;
+            batch->transform_stack_depth = 1;
+        }
+    } else {
+        if (transform) {
+            batch->transform_stack[batch->transform_stack_depth - 1] = *transform;
+        } else {
+            batch->transform_stack_depth = 0;
         }
     }
 }
 
-void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image, int x, int y, int w, int h,
-                           float rot, GtVec2 origin, bool flip_x, bool flip_y, GtColor tint) {
-    // Pour l'instant, version simplifiée sans rotation/flip/origin
-    // TODO: implémenter transformation complète
-    (void)rot; (void)origin; (void)flip_x; (void)flip_y;
-    if (!renderer || !renderer->window || !image) return;
-    if (renderer->type == GT_RENDERER_GDI) {
-        // Draw scaled
-        int img_w = gtImageGetWidth(image);
-        int img_h = gtImageGetHeight(image);
-        uint32_t* img_pixels = gtImageGetPixels(image);
-        if (!img_pixels) return;
-
-        GtWindow* win = renderer->window;
-
-        if (w <= 0 || h <= 0) return;
-
-        // Simple nearest-neighbor scaling avec clipping
-        for (int dy = 0; dy < h; dy++) {
-            int src_y = (int)((float)dy * img_h / h);
-            if (src_y < 0) src_y = 0;
-            if (src_y >= img_h) src_y = img_h - 1;
-
-            int dst_y = y + dy;
-            if (dst_y < 0 || dst_y >= win->height) continue;
-
-            uint32_t* dst_row = &win->buffer[(size_t)dst_y * (size_t)win->width];
-            for (int dx = 0; dx < w; dx++) {
-                int src_x = (int)((float)dx * img_w / w);
-                if (src_x < 0) src_x = 0;
-                if (src_x >= img_w) src_x = img_w - 1;
-
-                int dst_x = x + dx;
-                if (dst_x < 0 || dst_x >= win->width) continue;
-
-                uint32_t src = img_pixels[(size_t)src_y * (size_t)img_w + (size_t)src_x];
-                uint32_t sa = (src >> 24) & 0xFFu;
-                if (sa == 0) continue;
-
-                if (((tint >> 24) & 0xFFu) != 255) {
-                    // Applique teinte
-                    uint32_t sr = ((src >> 16) & 0xFFu) * ((tint >> 16) & 0xFFu) / 255;
-                    uint32_t sg = ((src >> 8) & 0xFFu) * ((tint >> 8) & 0xFFu) / 255;
-                    uint32_t sb = (src & 0xFFu) * (tint & 0xFFu) / 255;
-                    src = (sa << 24) | (sr << 16) | (sg << 8) | sb;
-                }
-
-                dst_row[(size_t)dst_x] = gtBlendPixel(dst_row[(size_t)dst_x], src);
-            }
-        }
+void gtBatchPushTransform(GtBatchRenderer* batch) {
+    if (!batch || batch->transform_stack_depth >= GT_BATCH_MAX_TRANSFORM_STACK) return;
+    if (batch->transform_stack_depth == 0) {
+        batch->transform_stack[0] = gtMat3Identity();
+    } else {
+        batch->transform_stack[batch->transform_stack_depth] = batch->transform_stack[batch->transform_stack_depth - 1];
     }
+    batch->transform_stack_depth++;
+}
+
+void gtBatchPopTransform(GtBatchRenderer* batch) {
+    if (!batch || batch->transform_stack_depth == 0) return;
+    batch->transform_stack_depth--;
+}
+
+void gtBatchTranslate(GtBatchRenderer* batch, float tx, float ty) {
+    if (!batch) return;
+    GtMat3 m = gtMat3Translate(tx, ty);
+    if (batch->transform_stack_depth == 0) gtBatchPushTransform(batch);
+    GtMat3* cur = &batch->transform_stack[batch->transform_stack_depth - 1];
+    *cur = gtMat3Mul(*cur, m);
+}
+
+void gtBatchRotate(GtBatchRenderer* batch, float angle_rad) {
+    if (!batch) return;
+    GtMat3 m = gtMat3Rotate(angle_rad);
+    if (batch->transform_stack_depth == 0) gtBatchPushTransform(batch);
+    GtMat3* cur = &batch->transform_stack[batch->transform_stack_depth - 1];
+    *cur = gtMat3Mul(*cur, m);
+}
+
+void gtBatchScale(GtBatchRenderer* batch, float sx, float sy) {
+    if (!batch) return;
+    GtMat3 m = gtMat3Scale(sx, sy);
+    if (batch->transform_stack_depth == 0) gtBatchPushTransform(batch);
+    GtMat3* cur = &batch->transform_stack[batch->transform_stack_depth - 1];
+    *cur = gtMat3Mul(*cur, m);
+}
+
+void gtBatchSetScissorRect(GtBatchRenderer* batch, int x, int y, int w, int h) {
+    if (!batch) return;
+    if (batch->scissor_stack_depth == 0) {
+        batch->scissor_stack[0].x = x;
+        batch->scissor_stack[0].y = y;
+        batch->scissor_stack[0].w = w;
+        batch->scissor_stack[0].h = h;
+        batch->scissor_stack[0].active = (w > 0 && h > 0);
+        batch->scissor_stack_depth = 1;
+    } else {
+        batch->scissor_stack[batch->scissor_stack_depth - 1].x = x;
+        batch->scissor_stack[batch->scissor_stack_depth - 1].y = y;
+        batch->scissor_stack[batch->scissor_stack_depth - 1].w = w;
+        batch->scissor_stack[batch->scissor_stack_depth - 1].h = h;
+        batch->scissor_stack[batch->scissor_stack_depth - 1].active = (w > 0 && h > 0);
+    }
+}
+
+void gtBatchGetStats(const GtBatchRenderer* batch, GtBatchStats* out_stats) {
+    if (!batch || !out_stats) return;
+    out_stats->vertices_used = batch->vertex_count;
+    out_stats->max_vertices = batch->vertex_capacity;
+    out_stats->flush_count = batch->flush_count;
+    out_stats->draw_calls = batch->draw_calls;
 }
 
 /* -------------------------------------------------------------------------
