@@ -734,10 +734,22 @@ void gtRendererPopScissorRect(GtRenderer* renderer);
 // Récupère le rectangle de clipping actif
 void gtRendererGetScissorRect(const GtRenderer* renderer, int* out_x, int* out_y, int* out_w, int* out_h);
 
-// Dessin de texte via renderer
+// Dessine un caractère unique (police bitmap 8x8). ASCII 32-126 rendu ;
+// hors plage : ignoré. Route vers l'atlas GPU si un renderer D2D est attaché.
+void gtDrawChar(GtWindow* window, int x, int y, char c, uint32_t color);
+
+// Dessine une chaîne formatée style printf (buffer interne 512 octets, tronqué
+// au-delà). Même rendu que gtDrawText (police 8x8), routing D2D identique.
+void gtDrawTextFmt(GtWindow* window, int x, int y, uint32_t color, const char* fmt, ...);
+
+// Dessine du texte via renderer
 void gtRendererDrawText(GtRenderer* renderer, int x, int y, const char* text, GtColor color);
 void gtRendererDrawTextEx(GtRenderer* renderer, int x, int y, const char* text, GtColor color,
                           float scale, int spacing, int wrap_width);
+
+// Texte formaté style printf via renderer (transforme le point d'origine comme
+// gtRendererDrawText, buffer interne 512 octets).
+void gtRendererDrawTextFmt(GtRenderer* renderer, int x, int y, GtColor color, const char* fmt, ...);
 
 // Texte haute qualité (DirectWrite) - D2D uniquement
 // font_px : taille de police en pixels. La police est configurable via
@@ -1039,6 +1051,7 @@ void             gtInputSetVibration(int player_index, float left_motor, float r
 #include <string.h>       // memset, memcpy
 #include <math.h>         // sqrtf, sinf, cosf (pour gtVec2Len, cercles)
 #include <stdio.h>        // fopen, fclose, fread (pour stb_image)
+#include <stdarg.h>       // va_list (gtDrawTextFmt, gtRendererDrawTextFmt)
 
 // Backend Direct2D (optionnel : LIBGT_NO_D2D pour construire sans).
 // initguid.h AVANT d2d1.h/dwrite.h : émet les définitions des IID dans ce TU
@@ -2963,6 +2976,12 @@ static void gtD2DDrawTextRun(ID2D1RenderTarget* rt, GtD2DPaint* paint, ID2D1Bitm
             continue;
         }
 
+        // Tabulation : avance de 4 cellules (comme le chemin GDI)
+        if (c == '\t') {
+            cur_x += 4.0f * char_w;
+            continue;
+        }
+
         if (wrap_width > 0 && c == ' ') {
             const char* next = p + 1;
             float word_w = 0.0f;
@@ -3984,6 +4003,21 @@ void gtRendererDrawTextEx(GtRenderer* renderer, int x, int y,
     GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)x, (float)y));
     gtDrawTextEx(renderer->window, (int)p.x, (int)p.y, text, color,
                  scale, spacing, wrap_width);
+}
+
+// Texte formaté style printf via renderer : transforme le point d'origine
+// (comme gtRendererDrawText) puis délègue. Buffer interne 512 octets.
+void gtRendererDrawTextFmt(GtRenderer* renderer, int x, int y, GtColor color, const char* fmt, ...) {
+    if (!renderer || !renderer->window || !fmt) return;
+
+    char buffer[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)x, (float)y));
+    gtDrawTextEx(renderer->window, (int)p.x, (int)p.y, buffer, color, 1.0f, 0, 0);
 }
 
 void gtRendererDrawImage(GtRenderer* renderer, GtImage* image,
@@ -5180,7 +5214,8 @@ uint32_t* gtImageGetPixels(GtImage* image) {
 /* -------------------------------------------------------------------------
 * IMPLÉMENTATION : RENDU DE TEXTE (Bitmap font 8x8)
 * ------------------------------------------------------------------------- */
-static inline void gtDrawChar(GtWindow* window, int x, int y, char c, uint32_t color, float scale) {
+// Version interne scalée (utilisée par gtDrawTextEx)
+static void gtDrawCharScaled(GtWindow* window, int x, int y, char c, uint32_t color, float scale) {
     if (c < 32 || c > 126) return;  // Hors police (ASCII 32-126)
 
     int idx = (int)c - 32;
@@ -5227,6 +5262,26 @@ static inline void gtDrawChar(GtWindow* window, int x, int y, char c, uint32_t c
     }
 }
 
+// Dessine un caractère unique (API publique, scale 1). Route vers l'atlas GPU
+// si un renderer D2D est attaché à la fenêtre, sinon blit bitmap CPU.
+void gtDrawChar(GtWindow* window, int x, int y, char c, uint32_t color) {
+    if (!window) return;
+#ifndef LIBGT_NO_D2D
+    if (window->renderer && window->renderer->type == GT_RENDERER_D2D) {
+        GtRenderer* r = window->renderer;
+        if (!gtD2DBeginDraw(r)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+        ID2D1Bitmap* atlas = gtD2DGetFontAtlas(rt, &r->d2d, color);
+        if (!atlas) return;
+        D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+        ID2D1RenderTarget_SetTransform(rt, &id);
+        gtD2DDrawGlyph(rt, &r->d2d, atlas, (float)x, (float)y, c, 1.0f);
+        return;
+    }
+#endif
+    gtDrawCharScaled(window, x, y, c, color, 1.0f);
+}
+
 void gtDrawText(GtWindow* window, int x, int y, const char* text, uint32_t color) {
     gtDrawTextEx(window, x, y, text, color, 1.0f, 0, 0);
 }
@@ -5266,6 +5321,12 @@ void gtDrawTextEx(GtWindow* window, int x, int y, const char* text, uint32_t col
             continue;
         }
 
+        // Tabulation : avance de 4 cellules de caractère
+        if (c == '\t') {
+            cur_x += char_w * 4;
+            continue;
+        }
+
         // Word wrap
         if (wrap_width > 0 && c == ' ') {
             // Regarde si le mot suivant tient sur la ligne
@@ -5281,9 +5342,23 @@ void gtDrawTextEx(GtWindow* window, int x, int y, const char* text, uint32_t col
             }
         }
 
-        gtDrawChar(window, cur_x, cur_y, c, color, scale);
+        gtDrawCharScaled(window, cur_x, cur_y, c, color, scale);
         cur_x += char_w + spacing;
     }
+}
+
+// Texte formaté style printf : formate en buffer interne puis délègue à
+// gtDrawTextEx (routing D2D identique). Tronqué à 511 caractères.
+void gtDrawTextFmt(GtWindow* window, int x, int y, uint32_t color, const char* fmt, ...) {
+    if (!window || !fmt) return;
+
+    char buffer[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    gtDrawTextEx(window, x, y, buffer, color, 1.0f, 0, 0);
 }
 
 void gtMeasureText(const char* text, float scale, int spacing, int wrap_width,
