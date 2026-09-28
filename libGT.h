@@ -430,6 +430,15 @@ bool gtWasMouseButtonReleased(GtWindow* window, int button);
 // Remet à zéro après lecture (consommer l'événement)
 int gtGetMouseWheelDelta(GtWindow* window);
 
+// Récupère les caractères tapés au clavier CETTE frame (WM_CHAR, via TranslateMessage).
+// Chaîne ANSI terminée par '\0', valide jusqu'au prochain gtEventsWindow ; plusieurs
+// appels dans la même frame retournent la même chaîne. Les caractères de contrôle
+// sont stockés tels quels : '\b' (8) backspace, '\t' (9) tab, '\r' (13) entrée,
+// 27 échappe — c'est à l'appelant de les interpréter (p.ex. effacer le dernier
+// caractère sur '\b'). Seuls les ASCII 32-126 sont rendus par la police bitmap.
+// Buffer limité à 31 caractères par frame (les excédents sont ignorés).
+const char* gtGetTypedText(GtWindow* window);
+
 // Récupère la position actuelle de la souris (coordonnées client : 0,0 en haut-gauche)
 // out_x, out_y : pointeurs vers int pour recevoir les coordonnées (peuvent être NULL)
 void gtGetMousePos(GtWindow* window, int* out_x, int* out_y);
@@ -696,6 +705,8 @@ void gtRendererRotate(GtRenderer* renderer, float angle_rad);
 void gtRendererScale(GtRenderer* renderer, float sx, float sy);
 
 // Applique une caméra (définit view matrix = camera view-proj)
+// Le viewport de la caméra est synchronisé automatiquement au resize de la
+// fenêtre — appeler gtCameraUpdate ensuite pour rafraîchir la view matrix.
 void gtRendererSetCamera(GtRenderer* renderer, const GtCamera* camera);
 
 // Récupère la caméra active (si définie via gtRendererSetCamera)
@@ -749,6 +760,17 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image, int x, int y, i
 // Dessin d'image avec transformation complète (matrice modèle)
 void gtRendererDrawImageTransformed(GtRenderer* renderer, GtImage* image, const GtMat3* model, GtColor tint);
 
+// Dessin d'un SOUS-RECTANGLE de l'image (spritesheets / animation).
+// Coordonnées UV normalisées [0..1] : (0,0) = coin haut-gauche de l'image,
+// (1,1) = coin bas-droit. Frame i d'une grille de N colonnes horizontales :
+//   u0 = i/N ; u1 = (i+1)/N ; v0 = 0 ; v1 = 1
+// (w,h) = taille à l'écran du sous-rect (nearest-neighbor). Les flips
+// miroirent le sous-rect. Pour la rotation, gtRendererDrawImageTransformed.
+void gtRendererDrawImageUV(GtRenderer* renderer, GtImage* image,
+                           int x, int y, int w, int h,
+                           float u0, float v0, float u1, float v1,
+                           bool flip_x, bool flip_y, GtColor tint);
+
 /* =========================================================================
 * BATCH RENDERING (2.1) - Vertex Buffer + Single Draw Call
 * =========================================================================
@@ -779,6 +801,10 @@ typedef struct GtBatchVertex {
     uint8_t glyph;        // Code ASCII (32-126) pour GT_BATCH_TEXT, 0 sinon
     uint8_t pad[2];       // Padding pour alignement 32 bytes
 } GtBatchVertex;
+
+// Contrat de layout : les deux backends (et un futur backend D3D11) s'appuient
+// sur cette taille — toute évolution du struct doit passer par ici.
+_Static_assert(sizeof(GtBatchVertex) == 32, "GtBatchVertex doit faire 32 octets");
 
 // Configuration du batch renderer
 typedef struct GtBatchConfig {
@@ -1294,6 +1320,9 @@ struct GtWindow {
     int  mouse_y;                // Position Y souris relative zone cliente
     int  mouse_wheel_delta;      // Delta molette accumulé cette frame (reset après lecture)
     bool mouse_tracking;         // Suivi WM_MOUSELEAVE actif (TrackMouseEvent)
+
+    char text_input[32];         // Caractères tapés (WM_CHAR) cette frame — vidée au
+    int  text_input_len;         // début de chaque gtEventsWindow (cf. gtGetTypedText)
 };
 
 /* -------------------------------------------------------------------------
@@ -1316,6 +1345,7 @@ static bool gtD2DWinDrawCircleLines(GtWindow* win, int cx, int cy, int radius, u
 static void gtD2DWindowSize(GtWindow* win, int new_width, int new_height);
 static bool gtWindowD2DPresent(GtWindow* win);  // EndDraw si frame D2D en cours
 #endif
+static void gtRendererSyncCameraViewport(GtWindow* win, int new_width, int new_height);
 
 /* -------------------------------------------------------------------------
 * RASTERISATION BAS NIVEAU (Accès direct mémoire, SANS clipping)
@@ -1568,6 +1598,15 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         if (win && wParam < 256) win->keys[wParam] = false;
         return DefWindowProcA(hwnd, msg, wParam, lParam);
 
+    case WM_CHAR:         // Caractère tapé (généré par TranslateMessage depuis WM_KEYDOWN)
+        // Inclut les caractères de contrôle : '\b' backspace, '\t' tab, '\r' entrée, 27 échappe.
+        // La fenêtre est ANSI (CreateWindowA) : wParam est un caractère de la page code ANSI.
+        if (win && win->text_input_len < (int)sizeof(win->text_input) - 1) {
+            win->text_input[win->text_input_len] = (char)wParam;
+            win->text_input[++win->text_input_len] = '\0';
+        }
+        break;
+
     // ===== SOURIS - BOUTONS =====
     case WM_LBUTTONDOWN:  // Clic gauche
         if (win) {
@@ -1705,6 +1744,9 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                     // Backend D2D : redimensionne (ou recrée) le render target
                     gtD2DWindowSize(win, new_width, new_height);
 #endif
+                    // Caméra attachée : viewport synchronisé (world<->screen
+                    // reste correct après resize, sans action de l'appelant)
+                    gtRendererSyncCameraViewport(win, new_width, new_height);
                 }
 
                 // Tracking souris invalide après resize (Windows l'annule)
@@ -1894,6 +1936,11 @@ bool gtEventsWindow(GtWindow* window) {
     // (pour edge detection : pressed/released cette frame)
     memcpy(window->keys_prev, window->keys, sizeof(window->keys));
     memcpy(window->mouse_buttons_prev, window->mouse_buttons, sizeof(window->mouse_buttons));
+
+    // Vide la saisie de texte de la frame précédente : les WM_CHAR arrivant
+    // pendant le pump ci-dessous s'accumulent pour CETTE frame.
+    window->text_input[0] = '\0';
+    window->text_input_len = 0;
 
     MSG msg;
     // PM_REMOVE = retire le message de la file après lecture
@@ -2218,6 +2265,13 @@ int gtGetMouseWheelDelta(GtWindow* window) {
     int delta = window->mouse_wheel_delta;
     window->mouse_wheel_delta = 0;
     return delta;
+}
+
+// Caractères tapés cette frame : vidés au début de chaque gtEventsWindow,
+// remplis pendant le pump de messages, stables jusqu'au prochain appel.
+const char* gtGetTypedText(GtWindow* window) {
+    if (!window) return "";
+    return window->text_input;
 }
 
 // Vérifie si la fenêtre doit fermer (WM_CLOSE reçu ou WM_QUIT)
@@ -3299,6 +3353,17 @@ void gtRendererDrawTextHq(GtRenderer* renderer, float x, float y, const char* te
 
 #endif // LIBGT_NO_D2D
 
+// WM_SIZE : synchronise le viewport de la caméra attachée au renderer de la
+// fenêtre (valable pour les deux backends). La caméra reste possédée par
+// l'appelant — la lib ne touche qu'aux champs viewport ; gtCameraUpdate
+// recalcule la view matrix au prochain appel.
+static void gtRendererSyncCameraViewport(GtWindow* win, int new_width, int new_height) {
+    if (win && win->renderer && win->renderer->camera) {
+        win->renderer->camera->viewport_w = new_width;
+        win->renderer->camera->viewport_h = new_height;
+    }
+}
+
 // Stubs quand le backend D2D est désactivé à la compilation
 #ifdef LIBGT_NO_D2D
 void gtRendererSetHqFontName(GtRenderer* renderer, const char* font_name) {
@@ -4036,6 +4101,13 @@ void gtRendererDrawImage(GtRenderer* renderer, GtImage* image,
     }
 }
 
+// Blit software d'un sous-rectangle UV (GDI) — défini plus bas, partagé par
+// gtRendererDrawImageEx (image complète : UV 0..1) et gtRendererDrawImageUV.
+static void gtBlitImageUV(GtRenderer* renderer, GtImage* image,
+                          int x, int y, int w, int h,
+                          float u0, float v0, float u1, float v1,
+                          bool flip_x, bool flip_y, GtColor tint);
+
 void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
                            int x, int y, int w, int h,
                            float rot, GtVec2 origin,
@@ -4085,12 +4157,41 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
     (void)rot;
     (void)origin;
 
+    gtBlitImageUV(renderer, image, x, y, w, h, 0.0f, 0.0f, 1.0f, 1.0f,
+                  flip_x, flip_y, tint);
+}
+
+// Blit software d'un sous-rectangle UV de l'image (GDI). Utilisé par
+// gtRendererDrawImageEx (image complète : UV 0..1) et gtRendererDrawImageUV.
+static void gtBlitImageUV(GtRenderer* renderer, GtImage* image,
+                          int x, int y, int w, int h,
+                          float u0, float v0, float u1, float v1,
+                          bool flip_x, bool flip_y, GtColor tint) {
     if (!renderer || !renderer->window || !image || w <= 0 || h <= 0) return;
+    if (u1 <= u0 || v1 <= v0) return;
 
     int img_w = gtImageGetWidth(image);
     int img_h = gtImageGetHeight(image);
     uint32_t* img_pixels = gtImageGetPixels(image);
     if (!img_pixels || img_w <= 0 || img_h <= 0) return;
+
+    // Bornes source en pixels (arrondi : tolère les fractions non exactes
+    // type 0.9999999 pour v1=1.0 d'un spritesheet)
+    int sx0 = (int)(u0 * (float)img_w + 0.5f);
+    int sx1 = (int)(u1 * (float)img_w + 0.5f);
+    int sy0 = (int)(v0 * (float)img_h + 0.5f);
+    int sy1 = (int)(v1 * (float)img_h + 0.5f);
+    if (sx0 < 0) sx0 = 0;
+    if (sx0 > img_w) sx0 = img_w;
+    if (sx1 < sx0) sx1 = sx0;
+    if (sx1 > img_w) sx1 = img_w;
+    if (sy0 < 0) sy0 = 0;
+    if (sy0 > img_h) sy0 = img_h;
+    if (sy1 < sy0) sy1 = sy0;
+    if (sy1 > img_h) sy1 = img_h;
+    int sub_w = sx1 - sx0;
+    int sub_h = sy1 - sy0;
+    if (sub_w <= 0 || sub_h <= 0) return;
 
     float tx = (float)x;
     float ty = (float)y;
@@ -4141,10 +4242,10 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
     for (int dy = 0; dy < clipped_h; dy++) {
         int dst_y = screen_y1 + dy;
         float src_frac_y = (float)(dy + (screen_y1 - (int)ty)) / th;
-        int src_y = (int)(src_frac_y * (float)img_h);
-        if (src_y < 0) src_y = 0;
-        if (src_y >= img_h) src_y = img_h - 1;
-        if (flip_y) src_y = img_h - 1 - src_y; // miroir vertical exact
+        int src_y = sy0 + (int)(src_frac_y * (float)sub_h);
+        if (src_y < sy0) src_y = sy0;
+        if (src_y >= sy1) src_y = sy1 - 1;
+        if (flip_y) src_y = sy1 - 1 - (src_y - sy0); // miroir vertical dans le sous-rect
 
         uint32_t* dst_row =
             &win->buffer[(size_t)dst_y * (size_t)win->width];
@@ -4152,10 +4253,10 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
         for (int dx = 0; dx < clipped_w; dx++) {
             int dst_x = screen_x1 + dx;
             float src_frac_x = (float)(dx + (screen_x1 - (int)tx)) / tw;
-            int src_x = (int)(src_frac_x * (float)img_w);
-            if (src_x < 0) src_x = 0;
-            if (src_x >= img_w) src_x = img_w - 1;
-            if (flip_x) src_x = img_w - 1 - src_x; // miroir horizontal exact
+            int src_x = sx0 + (int)(src_frac_x * (float)sub_w);
+            if (src_x < sx0) src_x = sx0;
+            if (src_x >= sx1) src_x = sx1 - 1;
+            if (flip_x) src_x = sx1 - 1 - (src_x - sx0); // miroir horizontal dans le sous-rect
 
             uint32_t src =
                 img_pixels[(size_t)src_y * (size_t)img_w + (size_t)src_x];
@@ -4172,6 +4273,57 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
             dst_row[(size_t)dst_x] = gtBlendPixel(dst_row[(size_t)dst_x], src);
         }
     }
+}
+
+// Dessine un sous-rectangle de l'image (spritesheets). Coordonnées UV
+// normalisées [0..1] : frame i d'une grille de N colonnes = u0 = i/N,
+// u1 = (i+1)/N. Taille écran (w,h) libre (nearest-neighbor). Flips miroirent
+// le sous-rect. D2D : sourceRect natif. Pour la rotation, utiliser
+// gtRendererDrawImageTransformed.
+void gtRendererDrawImageUV(GtRenderer* renderer, GtImage* image,
+                           int x, int y, int w, int h,
+                           float u0, float v0, float u1, float v1,
+                           bool flip_x, bool flip_y, GtColor tint) {
+    if (!renderer || !renderer->window || !image || w <= 0 || h <= 0) return;
+    if ((tint >> 24) == 0) return;
+    if (u1 <= u0 || v1 <= v0) return;
+
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        int img_w = gtImageGetWidth(image);
+        int img_h = gtImageGetHeight(image);
+        if (img_w <= 0 || img_h <= 0) return;
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        ID2D1Bitmap* bmp = gtD2DGetTintedBitmap(rt, &renderer->d2d, image, tint);
+        if (!bmp) return;
+
+        // Transform utilisateur + miroir du sous-rect autour de son centre
+        // (même composition que gtRendererDrawImageEx, sans rot/origin)
+        const GtMat3* user = gtRendererGetCurrentTransform(renderer);
+        GtMat3 m = user ? *user : gtMat3Identity();
+        if (flip_x || flip_y) {
+            float fcx = (float)x + (float)w * 0.5f;
+            float fcy = (float)y + (float)h * 0.5f;
+            m = gtMat3Mul(m, gtMat3Translate(fcx, fcy));
+            m = gtMat3Mul(m, gtMat3Scale(flip_x ? -1.0f : 1.0f, flip_y ? -1.0f : 1.0f));
+            m = gtMat3Mul(m, gtMat3Translate(-fcx, -fcy));
+        }
+        D2D1_MATRIX_3X2_F dm = gtD2DMatrix(&m);
+        ID2D1RenderTarget_SetTransform(rt, &dm);
+
+        D2D1_RECT_F dst;
+        dst.left = (float)x; dst.top = (float)y;
+        dst.right = dst.left + (float)w; dst.bottom = dst.top + (float)h;
+        D2D1_RECT_F src;
+        src.left = u0 * (float)img_w;          src.top = v0 * (float)img_h;
+        src.right = u1 * (float)img_w;         src.bottom = v1 * (float)img_h;
+        ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
+                                     D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
+        return;
+    }
+#endif
+    gtBlitImageUV(renderer, image, x, y, w, h, u0, v0, u1, v1, flip_x, flip_y, tint);
 }
 
 void gtRendererDrawImageTransformed(GtRenderer* renderer,
@@ -6207,9 +6359,11 @@ static void gtXInputLoad(void) {
         if (g_gtXInput.module) break;
     }
     if (g_gtXInput.module) {
-        g_gtXInput.get_state = (DWORD (WINAPI*)(DWORD, XINPUT_STATE*))(void*)
+        // Passage par uintptr_t : conversion propre ISO C objet<->fonction
+        // (évite le warning -Wpedantic du cast direct).
+        g_gtXInput.get_state = (DWORD (WINAPI*)(DWORD, XINPUT_STATE*))(uintptr_t)
             GetProcAddress(g_gtXInput.module, "XInputGetState");
-        g_gtXInput.set_state = (DWORD (WINAPI*)(DWORD, XINPUT_VIBRATION*))(void*)
+        g_gtXInput.set_state = (DWORD (WINAPI*)(DWORD, XINPUT_VIBRATION*))(uintptr_t)
             GetProcAddress(g_gtXInput.module, "XInputSetState");
     }
 }
