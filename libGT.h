@@ -8,10 +8,10 @@
 #include <math.h>      // sqrtf, sinf, cosf, etc.
 
 /* =========================================================================
-* LIBGT - Bibliothèque graphique 2D légère pour Windows (GDI)
+* LIBGT - Bibliothèque graphique 2D légère pour Windows (GDI + Direct2D)
 * =========================================================================
 * Philosophie :
-*   - API simple, proche du matériel (framebuffer CPU)
+*   - API simple, proche du matériel (framebuffer CPU ou render target GPU)
 *   - Header-only : il suffit d'inclure ce fichier et de définir LIBGT_IMPLEMENTATION
 *     dans UN seul fichier .c pour obtenir l'implémentation
 *   - Zéro dépendance externe (juste Windows SDK)
@@ -32,6 +32,35 @@
 *       }
 *       gtDestroyWindow(win);
 *   }
+* =========================================================================
+* BACKENDS DE RENDU (2.2)
+* =========================================================================
+* Deux backends derrière la même API (gtCreateRenderer(win, type)) :
+*
+*   GT_RENDERER_GDI  : software, framebuffer CPU (win->buffer) + StretchDIBits.
+*                      Toujours disponible, pixel-exact, aucun lien GPU requis.
+*   GT_RENDERER_D2D  : Direct2D (ID2D1HwndRenderTarget). Primitives
+*                      anti-aliasées, images GPU, texte bitmap 8x8 via atlas
+*                      GPU + texte HQ DirectWrite (gtRendererDrawTextHq).
+*                      Linker avec : -ld2d1 -ldwrite -lole32
+*                      Désactivable à la compilation : -D LIBGT_NO_D2D
+*                      (gtCreateRenderer(..., GT_RENDERER_D2D) -> NULL).
+*                      Fallback interne : matériel -> logiciel -> NULL ;
+*                      vérifier avec gtRendererGetType().
+*
+* Matrice de compatibilité (écarts documentés entre backends) :
+*   - Z-order : identique (ordre d'appel). En D2D, les gtDraw* window-level
+*     sont routés vers le GPU ; win->buffer n'est alors PAS mis à jour
+*     (le lire en D2D est indéfini — les tests pixel passent par un RT WIC).
+*   - Transforms : GDI aplatit les rects tournés en AABB ; D2D applique la
+*     vraie rotation. Les cercles D2D respectent le scale de la transform.
+*   - gtRendererDrawImageEx : GDI ignore rot/origin ; D2D les implémente
+*     (x,y = point d'ancrage défini par origin, pivot de rotation).
+*   - gtRendererDrawTextHq : D2D = DirectWrite ; GDI = fallback police 8x8.
+*   - Anti-aliasing : activé par défaut en D2D (gtRendererSetAntialias pour
+*     le mode pixel-exact ALIASED) ; GDI est toujours sans AA.
+*
+* Threading : factory D2D SINGLE_THREADED — un renderer par thread.
 * ========================================================================= */
 
 /* =========================================================================
@@ -584,20 +613,35 @@ int gtTimersUpdate(float dt);
 * ========================================================================= */
 
 // Type de backend de rendu
+// - GT_RENDERER_GDI : software (framebuffer CPU + StretchDIBits), défaut, toujours dispo.
+// - GT_RENDERER_D2D : Direct2D (GPU, anti-aliasing, texte HQ DirectWrite).
+//   Linker avec -ld2d1 -ldwrite -lole32. Désactivable à la compilation avec
+//   LIBGT_NO_D2D (gtCreateRenderer(..., GT_RENDERER_D2D) retournera alors NULL).
 typedef enum {
-    GT_RENDERER_GDI   // GDI software (framebuffer CPU + StretchDIBits) - défaut, toujours dispo
+    GT_RENDERER_GDI,  // GDI software (framebuffer CPU + StretchDIBits) - défaut, toujours dispo
+    GT_RENDERER_D2D   // Direct2D (GPU) : primitives AA, images, texte bitmap via atlas + texte HQ DWrite
 } GtRendererType;
 
 // Structure opaque du renderer (détails dans section IMPLEMENTATION)
 typedef struct GtRenderer GtRenderer;
 
 // Crée un renderer pour une fenêtre donnée
-// type : GT_RENDERER_GDI
-// Retourne NULL si échec (fenêtre invalide, GetDC échoue, OOM)
+// type : GT_RENDERER_GDI ou GT_RENDERER_D2D
+// D2D : tente un render target matériel, puis logiciel (D2D1_RENDER_TARGET_TYPE_SOFTWARE),
+//       retourne NULL si Direct2D est indisponible (utiliser gtRendererGetType pour vérifier).
+// Retourne NULL si échec (fenêtre invalide, OOM)
 GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type);
 
-// Détruit le renderer et libère ses ressources (ReleaseDC pour GDI)
+// Détruit le renderer et libère ses ressources (ReleaseDC pour GDI, COM pour D2D)
 void        gtDestroyRenderer(GtRenderer* renderer);
+
+// Retourne le backend effectivement utilisé (GT_RENDERER_GDI ou GT_RENDERER_D2D)
+GtRendererType gtRendererGetType(const GtRenderer* renderer);
+
+// (D2D) Active/désactive l'anti-aliasing des primitives (défaut : activé).
+// OFF = D2D1_ANTIALIAS_MODE_ALIASED (rendu pixel-exact, utile pour le pixel-art).
+// Sans effet sur le backend GDI.
+void gtRendererSetAntialias(GtRenderer* renderer, bool antialias);
 
 // =========================================================================
 // API DE DESSIN VIA RENDERER (remplace gtDraw* sur GtWindow)
@@ -683,6 +727,16 @@ void gtRendererGetScissorRect(const GtRenderer* renderer, int* out_x, int* out_y
 void gtRendererDrawText(GtRenderer* renderer, int x, int y, const char* text, GtColor color);
 void gtRendererDrawTextEx(GtRenderer* renderer, int x, int y, const char* text, GtColor color,
                           float scale, int spacing, int wrap_width);
+
+// Texte haute qualité (DirectWrite) - D2D uniquement
+// font_px : taille de police en pixels. La police est configurable via
+// gtRendererSetHqFontName (défaut : "Segoe UI"). Sur le backend GDI, fallback
+// propre : rendu via la police bitmap 8x8 à l'échelle font_px/8.
+void gtRendererDrawTextHq(GtRenderer* renderer, float x, float y, const char* text,
+                          float font_px, GtColor color);
+// (D2D) Change la police du texte HQ (copiée en interne). Prend effet au prochain
+// gtRendererDrawTextHq. Sans effet sur le backend GDI.
+void gtRendererSetHqFontName(GtRenderer* renderer, const char* font_name);
 
 // Dessin d'image via renderer
 // image : pointeur GtImage* retourné par gtLoadImage
@@ -960,6 +1014,24 @@ void             gtInputSetVibration(int player_index, float left_motor, float r
 #include <math.h>         // sqrtf, sinf, cosf (pour gtVec2Len, cercles)
 #include <stdio.h>        // fopen, fclose, fread (pour stb_image)
 
+// Backend Direct2D (optionnel : LIBGT_NO_D2D pour construire sans).
+// initguid.h AVANT d2d1.h/dwrite.h : émet les définitions des IID dans ce TU
+// (indispensable : libuuid.a ne contient aucun IID DirectWrite).
+// Linker avec : -ld2d1 -ldwrite -lole32
+#ifndef LIBGT_NO_D2D
+#include <initguid.h>
+#ifndef COBJMACROS
+#define COBJMACROS
+#define LIBGT_TMP_COBJMACROS
+#endif
+#include <d2d1.h>
+#include <dwrite.h>
+#ifdef LIBGT_TMP_COBJMACROS
+#undef COBJMACROS
+#undef LIBGT_TMP_COBJMACROS
+#endif
+#endif // LIBGT_NO_D2D
+
 // Le nom de classe est partagé par toutes les fenêtres du processus.
 // On accepte ERROR_CLASS_ALREADY_EXISTS lors des créations suivantes.
 
@@ -984,6 +1056,12 @@ struct GtImage {
     int height;
     int channels;        // Toujours 4 (ARGB) après chargement
     uint32_t* pixels;    // Buffer ARGB 32bpp, top-down (stride = width * 4)
+
+#ifndef LIBGT_NO_D2D
+    // Cache backend Direct2D (bitmap prémultipliée uploadée, tag owner = RT)
+    void* d2d_bitmap;
+    void* d2d_owner;
+#endif
 };
 
 /* -------------------------------------------------------------------------
@@ -1203,6 +1281,11 @@ struct GtWindow {
     uint32_t* buffer;        // Framebuffer 1D : buffer[y * width + x] = couleur ARGB
     BITMAPINFO bmi;          // Description du format bitmap pour StretchDIBits (GDI)
 
+    // Renderer attaché (back-pointer posé par gtCreateRenderer). En mode D2D,
+    // les gtDraw* window-level sont routés vers le GPU et win->buffer devient
+    // obsolète (non mis à jour) — le z-order reste l'ordre d'appel.
+    struct GtRenderer* renderer;
+
     bool keys[256];              // État clavier : true = enfoncée (index = code VK)
     bool keys_prev[256];         // État clavier frame précédente (pour edge detection)
     bool mouse_buttons[3];       // État souris : [0]=gauche, [1]=droit, [2]=milieu
@@ -1212,6 +1295,27 @@ struct GtWindow {
     int  mouse_wheel_delta;      // Delta molette accumulé cette frame (reset après lecture)
     bool mouse_tracking;         // Suivi WM_MOUSELEAVE actif (TrackMouseEvent)
 };
+
+/* -------------------------------------------------------------------------
+* BACKEND DIRECT2D - DÉLÉGATIONS ANTICIPÉES
+* -------------------------------------------------------------------------
+* Le cœur D2D est implémenté dans la section RENDERER (plus bas, après
+* struct GtRenderer). Ces prototypes permettent de router les fonctions
+* window-level (définies avant) vers le GPU quand un renderer D2D est
+* attaché à la fenêtre. Toutes retournent/faillent proprement si le
+* backend D2D est désactivé (LIBGT_NO_D2D) ou absent.
+* ------------------------------------------------------------------------- */
+#ifndef LIBGT_NO_D2D
+static bool gtD2DWinClear(GtWindow* win, uint32_t color);
+static bool gtD2DWinDrawPixel(GtWindow* win, int x, int y, uint32_t color);
+static bool gtD2DWinDrawRect(GtWindow* win, int x, int y, int w, int h, uint32_t color);
+static bool gtD2DWinDrawRectLines(GtWindow* win, int x, int y, int w, int h, uint32_t color);
+static bool gtD2DWinDrawLine(GtWindow* win, int x1, int y1, int x2, int y2, uint32_t color);
+static bool gtD2DWinDrawCircle(GtWindow* win, int cx, int cy, int radius, uint32_t color);
+static bool gtD2DWinDrawCircleLines(GtWindow* win, int cx, int cy, int radius, uint32_t color);
+static void gtD2DWindowSize(GtWindow* win, int new_width, int new_height);
+static bool gtWindowD2DPresent(GtWindow* win);  // EndDraw si frame D2D en cours
+#endif
 
 /* -------------------------------------------------------------------------
 * RASTERISATION BAS NIVEAU (Accès direct mémoire, SANS clipping)
@@ -1596,6 +1700,11 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                     // Clear immédiat pour éviter l'effet "cisaillé" (ancien stride vs nouveau stride)
                     size_t total = (size_t)new_width * new_height;
                     for (size_t i = 0; i < total; i++) win->buffer[i] = 0;
+
+#ifndef LIBGT_NO_D2D
+                    // Backend D2D : redimensionne (ou recrée) le render target
+                    gtD2DWindowSize(win, new_width, new_height);
+#endif
                 }
 
                 // Tracking souris invalide après resize (Windows l'annule)
@@ -1799,8 +1908,12 @@ bool gtEventsWindow(GtWindow* window) {
 // Copie le framebuffer RAM vers l'écran (Blitting GDI)
 // Utilise StretchDIBits : copie mémoire -> device context fenêtre
 // SRCCOPY = copie directe sans opération raster (ROP)
+// Mode D2D : termine la frame GPU (EndDraw) au lieu de blitter.
 void gtUpdateWindow(GtWindow* window) {
     if (!window || !window->hwnd || !window->buffer) return;
+#ifndef LIBGT_NO_D2D
+    if (gtWindowD2DPresent(window)) return;  // renderer D2D attaché : présent GPU
+#endif
     HDC hdc = GetDC(window->hwnd);  // Device context de la zone cliente
     if (!hdc) return;
 
@@ -1817,8 +1930,13 @@ void gtUpdateWindow(GtWindow* window) {
 
 // Effacement de l'écran avec une couleur unie
 // Parcourt tout le framebuffer (boucle simple, memset ne marche que pour 0x00/0xFF)
+// Mode D2D : Clear GPU (win->buffer n'est pas mis à jour)
 void gtClearWindow(GtWindow* window, uint32_t color) {
-    if (!window || !window->buffer) return;
+    if (!window) return;
+#ifndef LIBGT_NO_D2D
+    if (gtD2DWinClear(window, color)) return;
+#endif
+    if (!window->buffer) return;
     size_t total_pixels = (size_t)window->width * (size_t)window->height;
 
     // Boucle pour toutes les couleurs (memset ne marche byte-wise que pour 0)
@@ -1836,6 +1954,9 @@ void gtClearWindow(GtWindow* window, uint32_t color) {
 
 // Dessine un seul pixel (avec clipping)
 void gtDrawPixel(GtWindow* window, int x, int y, uint32_t color) {
+#ifndef LIBGT_NO_D2D
+    if (gtD2DWinDrawPixel(window, x, y, color)) return;
+#endif
     drawPixelClipped64(window, (int64_t)x, (int64_t)y, color);
 }
 
@@ -1843,6 +1964,9 @@ void gtDrawPixel(GtWindow* window, int x, int y, uint32_t color) {
 // x,y = coin haut-gauche, w,h = largeur/hauteur en pixels
 // Clipping : intersection avec [0,width-1] x [0,height-1]
 void gtDrawRect(GtWindow* window, int x, int y, int w, int h, uint32_t color) {
+#ifndef LIBGT_NO_D2D
+    if (gtD2DWinDrawRect(window, x, y, w, h, color)) return;
+#endif
     if (!window || !window->buffer || w <= 0 || h <= 0) return;
 
     // Coordonnées du coin bas-droit (exclusif)
@@ -1882,6 +2006,9 @@ void gtDrawRect(GtWindow* window, int x, int y, int w, int h, uint32_t color) {
 // x,y = coin haut-gauche, w,h = largeur/hauteur
 // Les coins sont dessinés par les lignes horizontales (pas de double dessin)
 void gtDrawRectLines(GtWindow* window, int x, int y, int w, int h, uint32_t color) {
+#ifndef LIBGT_NO_D2D
+    if (gtD2DWinDrawRectLines(window, x, y, w, h, color)) return;
+#endif
     if (!window || !window->buffer || w <= 0 || h <= 0) return;
 
     // Coin bas-droit (inclusif pour les lignes)
@@ -1915,6 +2042,9 @@ void gtDrawRectLines(GtWindow* window, int x, int y, int w, int h, uint32_t colo
 // Dessine une ligne entre deux points (algorithme de Bresenham + clipping Cohen-Sutherland)
 // Clipping effectué AVANT rasterisation pour éviter calculs inutiles
 void gtDrawLine(GtWindow* window, int x1, int y1, int x2, int y2, uint32_t color) {
+#ifndef LIBGT_NO_D2D
+    if (gtD2DWinDrawLine(window, x1, y1, x2, y2, color)) return;
+#endif
     if (!window || !window->buffer) return;
 
     // Clip le segment aux bornes de la fenêtre
@@ -1930,6 +2060,9 @@ void gtDrawLine(GtWindow* window, int x1, int y1, int x2, int y2, uint32_t color
 // cx,cy = centre, radius = rayon en pixels
 // Optimisation : si cercle entièrement dans l'écran, utilise putPixelUnchecked (sans clipping)
 void gtDrawCircleLines(GtWindow* window, int cx, int cy, int radius, uint32_t color) {
+#ifndef LIBGT_NO_D2D
+    if (gtD2DWinDrawCircleLines(window, cx, cy, radius, color)) return;
+#endif
     if (!window || !window->buffer || radius < 0) return;
 
     int64_t cx64 = cx;
@@ -1994,6 +2127,9 @@ void gtDrawCircleLines(GtWindow* window, int cx, int cy, int radius, uint32_t co
 // Dessine un cercle plein (disque) par balayage horizontal (scanlines)
 // Plus efficace que point-milieu pour remplissage : trace des lignes horizontales
 void gtDrawCircle(GtWindow* window, int cx, int cy, int radius, uint32_t color) {
+#ifndef LIBGT_NO_D2D
+    if (gtD2DWinDrawCircle(window, cx, cy, radius, color)) return;
+#endif
     if (!window || !window->buffer || radius < 0) return;
 
     int64_t cx64 = cx;
@@ -2294,11 +2430,14 @@ int gtTimersUpdate(float dt) {
 }
 
 /* -------------------------------------------------------------------------
-* IMPLÉMENTATION : RENDERER ABSTRACTION (Backend GDI)
+* IMPLÉMENTATION : RENDERER ABSTRACTION (Backends GDI + Direct2D)
 * -------------------------------------------------------------------------
 * Structure interne du renderer (opaque pour l'utilisateur).
-* Note: HDC n'est PAS stocké — obtenu via GetDC() à chaque frame dans gtRendererEnd
-*       pour éviter invalidation après WM_SIZE, changement DPI, veille, etc.
+* GDI : HDC n'est PAS stocké — obtenu via GetDC() à chaque frame dans
+*       gtRendererEnd pour éviter invalidation après WM_SIZE, DPI, veille.
+* D2D : un ID2D1HwndRenderTarget est créé au premier besoin et redimensionné
+*       sur WM_SIZE ; en cas de perte device (D2DERR_RECREATE_TARGET) il est
+*       jeté et recréé paresseusement, caches invalidés par tag owner.
 * ------------------------------------------------------------------------- */
 #define GT_RENDERER_MAX_TRANSFORM_STACK 32
 #define GT_RENDERER_MAX_SCISSOR_STACK 32
@@ -2308,27 +2447,492 @@ typedef struct GtRendererScissorState {
     bool active;
 } GtRendererScissorState;
 
+#ifndef LIBGT_NO_D2D
+// Entrée de cache : copie d'image teintée (prémultipliée) pour DrawBitmap.
+#define GT_D2D_MAX_TINTED 16
+typedef struct GtD2DTintedEntry {
+    GtImage* img;
+    uint32_t tint;
+    ID2D1Bitmap* bmp;
+} GtD2DTintedEntry;
+
+// Cache de brosses à indexation directe : les couleurs alternent vite
+// (particules, batch) et CreateSolidColorBrush par appel coûte cher.
+#define GT_D2D_BRUSH_CACHE 256
+typedef struct GtD2DBrushEntry {
+    uint32_t color;
+    ID2D1SolidColorBrush* brush;
+} GtD2DBrushEntry;
+
+// État de "peinture" D2D : ressources dérivées d'un ID2D1RenderTarget.
+// Séparé du renderer pour être testable hors-écran (render target WIC).
+typedef struct GtD2DPaint {
+    GtD2DBrushEntry brushes[GT_D2D_BRUSH_CACHE];  // brosses cachées (hash couleur)
+    ID2D1Bitmap* atlas;            // atlas police 8x8 teintée (1 couleur à la fois)
+    uint32_t atlas_color;
+    GtD2DTintedEntry tinted[GT_D2D_MAX_TINTED];  // copies d'images teintées (éviction circulaire)
+    int tinted_next;
+} GtD2DPaint;
+
+#define GT_D2D_MAX_FONT_FORMATS 8
+typedef struct GtD2DTextFormat {
+    IDWriteTextFormat* format;
+    float px;
+} GtD2DTextFormat;
+#endif // LIBGT_NO_D2D
+
 struct GtRenderer {
     GtWindow* window;          // Fenêtre cible
     GtRendererType type;       // Type de backend (GDI)
-    
+
     // Transform stack (model-view-projection matrix)
     GtMat3 transform_stack[GT_RENDERER_MAX_TRANSFORM_STACK];
     int transform_stack_depth; // 0 = identité (pas de transform)
-    
+
     // Scissor/Clipping rect stack (en coordonnées écran)
     GtRendererScissorState scissor_stack[GT_RENDERER_MAX_SCISSOR_STACK];
     int scissor_stack_depth;
-    
+
     // Caméra active (optionnelle)
     GtCamera* camera;
+
+#ifndef LIBGT_NO_D2D
+    // ---- Backend Direct2D ----
+    ID2D1Factory* d2d_factory;             // Partagé, créé une fois
+    ID2D1HwndRenderTarget* d2d_rt;         // NULL = à créer / device perdu
+    bool d2d_software;                     // RT logiciel (fallback sans GPU)
+    bool d2d_drawing;                      // Entre BeginDraw et EndDraw
+    HRESULT d2d_last_hr;                   // Dernier HRESULT d'EndDraw
+    int d2d_clip_depth;                    // PushAxisAlignedClip non encore popés
+    bool d2d_antialias;                    // Défaut : true (AA activé)
+    GtD2DPaint d2d;                        // Ressources dérivées du RT
+    // Texte HQ (DirectWrite)
+    IDWriteFactory* dwrite_factory;
+    IDWriteTextFormat* dwrite_formats[GT_D2D_MAX_FONT_FORMATS];
+    float dwrite_format_px[GT_D2D_MAX_FONT_FORMATS];
+    int dwrite_format_count;
+    wchar_t dwrite_font[64];               // Nom de police (défaut "Segoe UI")
+#endif
 };
 
+// ---------------------------------------------------------------------------
+// BACKEND DIRECT2D - CŒUR
+// ---------------------------------------------------------------------------
+#ifndef LIBGT_NO_D2D
+
+// Conversion couleur : GtColor ARGB droit -> D2D1_COLOR_F.
+// NB : les couleurs de BROSSE sont en alpha droit (D2D prémultiplie
+// lui-même au blend), contrairement aux données de BITMAP qui doivent
+// être prémultipliées à l'upload (cf. gtD2DGetImageBitmap).
+static inline D2D1_COLOR_F gtD2DColor(GtColor c) {
+    D2D1_COLOR_F out;
+    out.r = (float)((c >> 16) & 0xFFu) / 255.0f;
+    out.g = (float)((c >> 8) & 0xFFu) / 255.0f;
+    out.b = (float)(c & 0xFFu) / 255.0f;
+    out.a = (float)((c >> 24) & 0xFFu) / 255.0f;
+    return out;
+}
+
+// Conversion GtMat3 (affine, colonne-majeur : x' = m0*x + m3*y + m6) vers
+// D2D1_MATRIX_3X2_F (row-vector : x' = x*_11 + y*_21 + dx). Mapping exact :
+// _11=m0, _12=m1, _21=m3, _22=m4, dx=m6, dy=m7. NULL = identité.
+static inline D2D1_MATRIX_3X2_F gtD2DMatrix(const GtMat3* m) {
+    D2D1_MATRIX_3X2_F out;
+    if (m) {
+        out._11 = m->m[0]; out._12 = m->m[1];
+        out._21 = m->m[3]; out._22 = m->m[4];
+        out.dx  = m->m[6]; out.dy  = m->m[7];
+    } else {
+        out._11 = 1.0f; out._12 = 0.0f;
+        out._21 = 0.0f; out._22 = 1.0f;
+        out.dx  = 0.0f; out.dy  = 0.0f;
+    }
+    return out;
+}
+
+// Libère les ressources dérivées d'un RT (brosses, atlas, copies teintées)
+static void gtD2DInvalidatePaint(GtD2DPaint* paint) {
+    for (int i = 0; i < GT_D2D_BRUSH_CACHE; i++) {
+        if (paint->brushes[i].brush) {
+            ID2D1SolidColorBrush_Release(paint->brushes[i].brush);
+            paint->brushes[i].brush = NULL;
+        }
+        paint->brushes[i].color = 0;
+    }
+    if (paint->atlas) { ID2D1Bitmap_Release(paint->atlas); paint->atlas = NULL; }
+    paint->atlas_color = 0;
+    for (int i = 0; i < GT_D2D_MAX_TINTED; i++) {
+        if (paint->tinted[i].bmp) { ID2D1Bitmap_Release(paint->tinted[i].bmp); paint->tinted[i].bmp = NULL; }
+        paint->tinted[i].img = NULL;
+        paint->tinted[i].tint = 0;
+    }
+    paint->tinted_next = 0;
+}
+
+// Crée (ou recrée) le render target HWND. Retourne NULL si impossible.
+static ID2D1RenderTarget* gtD2DEnsureRT(GtRenderer* r) {
+    if (r->d2d_rt) return (ID2D1RenderTarget*)r->d2d_rt;
+    if (!r->d2d_factory || !r->window || !r->window->hwnd) return NULL;
+
+    int w = r->window->width > 0 ? r->window->width : 1;
+    int h = r->window->height > 0 ? r->window->height : 1;
+
+    D2D1_PIXEL_FORMAT pf;
+    pf.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pf.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+
+    D2D1_RENDER_TARGET_PROPERTIES rtp;
+    rtp.type = r->d2d_software ? D2D1_RENDER_TARGET_TYPE_SOFTWARE : D2D1_RENDER_TARGET_TYPE_DEFAULT;
+    rtp.pixelFormat = pf;
+    rtp.dpiX = 0.0f;
+    rtp.dpiY = 0.0f;
+    rtp.usage = D2D1_RENDER_TARGET_USAGE_NONE;
+    rtp.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
+
+    D2D1_HWND_RENDER_TARGET_PROPERTIES hrtp;
+    hrtp.hwnd = r->window->hwnd;
+    hrtp.pixelSize.width = (UINT32)w;
+    hrtp.pixelSize.height = (UINT32)h;
+    // IMMEDIATELY = pas d'attente vsync au EndDraw : la cadence appartient
+    // à l'application (comme le blit GDI, non synchronisé)
+    hrtp.presentOptions = D2D1_PRESENT_OPTIONS_IMMEDIATELY;
+
+    ID2D1HwndRenderTarget* rt = NULL;
+    HRESULT hr = ID2D1Factory_CreateHwndRenderTarget(r->d2d_factory, &rtp, &hrtp, &rt);
+    if (FAILED(hr)) return NULL;
+
+    r->d2d_rt = rt;
+    if (r->d2d_antialias) {
+        ID2D1RenderTarget_SetAntialiasMode((ID2D1RenderTarget*)rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    } else {
+        ID2D1RenderTarget_SetAntialiasMode((ID2D1RenderTarget*)rt, D2D1_ANTIALIAS_MODE_ALIASED);
+    }
+    return (ID2D1RenderTarget*)rt;
+}
+
+// BeginDraw paresseux : démarre la frame au premier dessin si pas commencée
+static bool gtD2DBeginDraw(GtRenderer* r) {
+    ID2D1RenderTarget* rt = gtD2DEnsureRT(r);
+    if (!rt) return false;
+    if (!r->d2d_drawing) {
+        ID2D1RenderTarget_BeginDraw(rt);
+        r->d2d_drawing = true;
+    }
+    return true;
+}
+
+// Termine la frame (idempotent). Vérifie le device : en cas de perte
+// (D2DERR_RECREATE_TARGET), jette le RT — recréé au prochain dessin,
+// caches invalidés par tag owner.
+static void gtD2DEndFrame(GtRenderer* r) {
+    if (!r || !r->d2d_rt || !r->d2d_drawing) return;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+
+    // Équilibre les clips restants (EndDraw exige Push/Pop appariés)
+    while (r->d2d_clip_depth > 0) {
+        ID2D1RenderTarget_PopAxisAlignedClip(rt);
+        r->d2d_clip_depth--;
+    }
+
+    D2D1_TAG t1 = 0, t2 = 0;
+    HRESULT hr = ID2D1RenderTarget_EndDraw(rt, &t1, &t2);
+    r->d2d_drawing = false;
+    r->d2d_last_hr = hr;
+
+    if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
+        // Device perdu : jette RT et ressources dérivées
+        gtD2DInvalidatePaint(&r->d2d);
+        ID2D1HwndRenderTarget_Release(r->d2d_rt);
+        r->d2d_rt = NULL;
+    }
+}
+
+// Brosse cachée (indexation directe par hash couleur) : évite de recréer
+// un COM object à chaque draw quand les couleurs alternent.
+static ID2D1SolidColorBrush* gtD2DGetBrush(ID2D1RenderTarget* rt, GtD2DPaint* paint, GtColor color) {
+    uint32_t slot = (color * 2654435761u) % GT_D2D_BRUSH_CACHE;
+    GtD2DBrushEntry* e = &paint->brushes[slot];
+    if (e->brush && e->color == (uint32_t)color) return e->brush;
+    if (e->brush) ID2D1SolidColorBrush_Release(e->brush);
+    e->brush = NULL;
+    D2D1_COLOR_F c = gtD2DColor(color);
+    HRESULT hr = ID2D1RenderTarget_CreateSolidColorBrush(rt, &c, NULL, &e->brush);
+    if (FAILED(hr)) { e->brush = NULL; return NULL; }
+    e->color = (uint32_t)color;
+    return e->brush;
+}
+
+// ---------------------------------------------------------------------------
+// COUCHE PRIMITIVES D2D (fonctionne sur n'importe quel ID2D1RenderTarget :
+// HwndRT en production, WIC RT pour les tests hors-écran)
+// ---------------------------------------------------------------------------
+
+static void gtD2DFillRect(ID2D1RenderTarget* rt, GtD2DPaint* paint,
+                          float x, float y, float w, float h, GtColor color) {
+    ID2D1SolidColorBrush* b = gtD2DGetBrush(rt, paint, color);
+    if (!b) return;
+    D2D1_RECT_F rect;
+    rect.left = x; rect.top = y; rect.right = x + w; rect.bottom = y + h;
+    ID2D1RenderTarget_FillRectangle(rt, &rect, (ID2D1Brush*)b);
+}
+
+static void gtD2DFrameRect(ID2D1RenderTarget* rt, GtD2DPaint* paint,
+                           float x, float y, float w, float h, GtColor color, float stroke) {
+    ID2D1SolidColorBrush* b = gtD2DGetBrush(rt, paint, color);
+    if (!b) return;
+    D2D1_RECT_F rect;
+    rect.left = x; rect.top = y; rect.right = x + w; rect.bottom = y + h;
+    ID2D1RenderTarget_DrawRectangle(rt, &rect, (ID2D1Brush*)b, stroke, NULL);
+}
+
+static void gtD2DDrawLineSeg(ID2D1RenderTarget* rt, GtD2DPaint* paint,
+                             float x1, float y1, float x2, float y2, GtColor color, float stroke) {
+    ID2D1SolidColorBrush* b = gtD2DGetBrush(rt, paint, color);
+    if (!b) return;
+    D2D1_POINT_2F p0, p1;
+    p0.x = x1; p0.y = y1;
+    p1.x = x2; p1.y = y2;
+    ID2D1RenderTarget_DrawLine(rt, p0, p1, (ID2D1Brush*)b, stroke, NULL);
+}
+
+static void gtD2DFillEllipse(ID2D1RenderTarget* rt, GtD2DPaint* paint,
+                             float cx, float cy, float radius, GtColor color) {
+    ID2D1SolidColorBrush* b = gtD2DGetBrush(rt, paint, color);
+    if (!b) return;
+    D2D1_ELLIPSE e;
+    e.point.x = cx; e.point.y = cy;
+    e.radiusX = radius; e.radiusY = radius;
+    ID2D1RenderTarget_FillEllipse(rt, &e, (ID2D1Brush*)b);
+}
+
+static void gtD2DStrokeEllipse(ID2D1RenderTarget* rt, GtD2DPaint* paint,
+                               float cx, float cy, float radius, GtColor color, float stroke) {
+    ID2D1SolidColorBrush* b = gtD2DGetBrush(rt, paint, color);
+    if (!b) return;
+    D2D1_ELLIPSE e;
+    e.point.x = cx; e.point.y = cy;
+    e.radiusX = radius; e.radiusY = radius;
+    ID2D1RenderTarget_DrawEllipse(rt, &e, (ID2D1Brush*)b, stroke, NULL);
+}
+
+// Upload (ou récupère du cache) une GtImage en ID2D1Bitmap prémultipliée.
+// Cache taggé owner : recréé si le RT a changé (device perdu).
+static ID2D1Bitmap* gtD2DGetImageBitmap(ID2D1RenderTarget* rt, GtImage* img) {
+    if (!rt || !img || !img->pixels || img->width <= 0 || img->height <= 0) return NULL;
+    if (img->d2d_bitmap && img->d2d_owner == (void*)rt) return (ID2D1Bitmap*)img->d2d_bitmap;
+    if (img->d2d_bitmap) { ID2D1Bitmap_Release((ID2D1Bitmap*)img->d2d_bitmap); img->d2d_bitmap = NULL; }
+
+    // Prémultiplie (copie) : pixels sont en alpha droit, D2D veut du premultiplié
+    size_t n = (size_t)img->width * (size_t)img->height;
+    uint32_t* premul = (uint32_t*)malloc(n * sizeof(uint32_t));
+    if (!premul) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t p = img->pixels[i];
+        uint32_t a = (p >> 24) & 0xFFu;
+        if (a == 255u) {
+            premul[i] = p;
+        } else if (a == 0u) {
+            premul[i] = 0;
+        } else {
+            uint32_t r = (((p >> 16) & 0xFFu) * a) / 255u;
+            uint32_t g = (((p >> 8) & 0xFFu) * a) / 255u;
+            uint32_t b = ((p & 0xFFu) * a) / 255u;
+            premul[i] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+
+    D2D1_BITMAP_PROPERTIES props;
+    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    props.dpiX = 0.0f;
+    props.dpiY = 0.0f;
+
+    D2D1_SIZE_U size;
+    size.width = (UINT32)img->width;
+    size.height = (UINT32)img->height;
+
+    ID2D1Bitmap* bmp = NULL;
+    HRESULT hr = ID2D1RenderTarget_CreateBitmap(rt, size, premul,
+                                                (UINT32)img->width * 4u, &props, &bmp);
+    free(premul);
+    if (FAILED(hr)) return NULL;
+
+    img->d2d_bitmap = (void*)bmp;
+    img->d2d_owner = (void*)rt;
+    return bmp;
+}
+
+// Copie d'image teintée (cache LRU circulaire) : DrawBitmap ne sait pas teinter
+static ID2D1Bitmap* gtD2DGetTintedBitmap(ID2D1RenderTarget* rt, GtD2DPaint* paint, GtImage* img, GtColor tint) {
+    if (!rt || !img || !paint) return NULL;
+    if (tint == GT_WHITE || (tint & 0x00FFFFFFu) == 0x00FFFFFFu) {
+        return gtD2DGetImageBitmap(rt, img);  // pas de teinte : bitmap brute
+    }
+
+    for (int i = 0; i < GT_D2D_MAX_TINTED; i++) {
+        if (paint->tinted[i].bmp && paint->tinted[i].img == img && paint->tinted[i].tint == (uint32_t)tint) {
+            if (img->d2d_owner != (void*)rt) break;  // bitmap d'un ancien RT : recréer
+            return paint->tinted[i].bmp;
+        }
+    }
+
+    int slot = paint->tinted_next % GT_D2D_MAX_TINTED;
+    paint->tinted_next++;
+    if (paint->tinted[slot].bmp) ID2D1Bitmap_Release(paint->tinted[slot].bmp);
+    paint->tinted[slot].bmp = NULL;
+
+    // Copie teintée calculée depuis les pixels sources (alpha droit) :
+    // teinte multiplicative + prémultiplication en une passe
+    int w = img->width, h = img->height;
+    size_t n = (size_t)w * (size_t)h;
+    uint32_t* data = (uint32_t*)malloc(n * sizeof(uint32_t));
+    if (!data) return NULL;
+
+    uint32_t tr = (tint >> 16) & 0xFFu, tg = (tint >> 8) & 0xFFu, tb = tint & 0xFFu;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t p = img->pixels[i];
+        uint32_t a = (p >> 24) & 0xFFu;
+        if (a == 0u) { data[i] = 0; continue; }
+        uint32_t r_ = (((p >> 16) & 0xFFu) * tr) / 255u;
+        uint32_t g_ = (((p >> 8) & 0xFFu) * tg) / 255u;
+        uint32_t b_ = ((p & 0xFFu) * tb) / 255u;
+        if (a != 255u) {  // prémultiplie
+            r_ = (r_ * a) / 255u;
+            g_ = (g_ * a) / 255u;
+            b_ = (b_ * a) / 255u;
+        }
+        data[i] = (a << 24) | (r_ << 16) | (g_ << 8) | b_;
+    }
+
+    D2D1_BITMAP_PROPERTIES props;
+    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    props.dpiX = 0.0f;
+    props.dpiY = 0.0f;
+
+    D2D1_SIZE_U size;
+    size.width = (UINT32)w;
+    size.height = (UINT32)h;
+
+    ID2D1Bitmap* bmp = NULL;
+    HRESULT hr = ID2D1RenderTarget_CreateBitmap(rt, size, data, (UINT32)w * 4u, &props, &bmp);
+    free(data);
+    if (FAILED(hr)) return NULL;
+
+    paint->tinted[slot].img = img;
+    paint->tinted[slot].tint = (uint32_t)tint;
+    paint->tinted[slot].bmp = bmp;
+    return bmp;
+}
+
+// Atlas de la police 8x8 : 95 glyphes de 8x8 px côte à côte (760x8),
+// pixels = couleur du texte (prémultipliée) là où le bit est à 1.
+// Cache mono-couleur : reconstruit au changement de couleur (~24 Ko d'upload).
+static ID2D1Bitmap* gtD2DGetFontAtlas(ID2D1RenderTarget* rt, GtD2DPaint* paint, GtColor color) {
+    if (!rt || !paint) return NULL;
+    if (paint->atlas && paint->atlas_color == (uint32_t)color) return paint->atlas;
+
+    const int AW = 95 * 8, AH = 8;
+    uint32_t* data = (uint32_t*)malloc((size_t)AW * AH * sizeof(uint32_t));
+    if (!data) return NULL;
+
+    D2D1_COLOR_F c = gtD2DColor(color);  // alpha droit
+    // Les données de bitmap doivent être prémultipliées
+    uint32_t cr = (uint32_t)(c.r * c.a * 255.0f + 0.5f);
+    uint32_t cg = (uint32_t)(c.g * c.a * 255.0f + 0.5f);
+    uint32_t cb = (uint32_t)(c.b * c.a * 255.0f + 0.5f);
+    uint32_t ca = (uint32_t)(c.a * 255.0f + 0.5f);
+    uint32_t lit = (ca << 24) | (cr << 16) | (cg << 8) | cb;
+
+    for (int ch = 0; ch < 95; ch++) {
+        const uint8_t* glyph = &gt_font8x8[ch * 8];
+        for (int row = 0; row < 8; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < 8; col++) {
+                data[(size_t)row * AW + (size_t)ch * 8 + col] = (bits & (0x80 >> col)) ? lit : 0;
+            }
+        }
+    }
+
+    D2D1_BITMAP_PROPERTIES props;
+    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    props.dpiX = 0.0f;
+    props.dpiY = 0.0f;
+
+    D2D1_SIZE_U size;
+    size.width = (UINT32)AW;
+    size.height = (UINT32)AH;
+
+    ID2D1Bitmap* bmp = NULL;
+    HRESULT hr = ID2D1RenderTarget_CreateBitmap(rt, size, data, (UINT32)AW * 4u, &props, &bmp);
+    free(data);
+    if (FAILED(hr)) return NULL;
+
+    if (paint->atlas) ID2D1Bitmap_Release(paint->atlas);
+    paint->atlas = bmp;
+    paint->atlas_color = (uint32_t)color;
+    return bmp;
+}
+
+// Dessine un caractère de la police 8x8 via l'atlas (équivalent gtDrawChar)
+static void gtD2DDrawGlyph(ID2D1RenderTarget* rt, GtD2DPaint* paint, ID2D1Bitmap* atlas,
+                           float x, float y, char ch, float scale) {
+    (void)paint;
+    if (ch < 32 || ch > 126) return;
+    D2D1_RECT_F src, dst;
+    src.left = (float)((ch - 32) * 8); src.top = 0.0f;
+    src.right = src.left + 8.0f;       src.bottom = 8.0f;
+    dst.left = x;                      dst.top = y;
+    dst.right = x + 8.0f * scale;      dst.bottom = y + 8.0f * scale;
+    ID2D1RenderTarget_DrawBitmap(rt, atlas, &dst, 1.0f,
+                                 D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
+}
+
+// Chaîne complète via atlas — réplique la boucle de gtDrawTextEx (wrap inclus)
+static void gtD2DDrawTextRun(ID2D1RenderTarget* rt, GtD2DPaint* paint, ID2D1Bitmap* atlas,
+                             const char* text, float x, float y, float scale,
+                             int spacing, int wrap_width) {
+    if (scale <= 0.0f) scale = 1.0f;
+    float char_w = 8.0f * scale;
+    float line_h = 8.0f * scale + (float)spacing;
+    float start_x = x;
+    float cur_x = x;
+    float cur_y = y;
+
+    for (const char* p = text; *p; p++) {
+        char c = *p;
+
+        if (c == '\n') {
+            cur_x = start_x;
+            cur_y += line_h;
+            continue;
+        }
+
+        if (wrap_width > 0 && c == ' ') {
+            const char* next = p + 1;
+            float word_w = 0.0f;
+            while (*next && *next != ' ' && *next != '\n') {
+                word_w += char_w + (float)spacing;
+                next++;
+            }
+            if (cur_x + word_w > start_x + (float)wrap_width) {
+                cur_x = start_x;
+                cur_y += line_h;
+            }
+        }
+
+        gtD2DDrawGlyph(rt, paint, atlas, cur_x, cur_y, c, scale);
+        cur_x += char_w + (float)spacing;
+    }
+}
+
+#endif // LIBGT_NO_D2D
+
 // Crée un renderer pour une fenêtre
-// type : GT_RENDERER_GDI
+// type : GT_RENDERER_GDI ou GT_RENDERER_D2D
 GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type) {
     if (!window) return NULL;
-    (void)type;  // GDI est le backend unique de cette version.
 
     GtRenderer* renderer = (GtRenderer*)calloc(1, sizeof(GtRenderer));
     if (!renderer) return NULL;
@@ -2336,27 +2940,377 @@ GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type) {
     renderer->window = window;
     renderer->type = GT_RENDERER_GDI;
 
+#ifndef LIBGT_NO_D2D
+    if (type == GT_RENDERER_D2D) {
+        renderer->d2d_antialias = true;
+        renderer->dwrite_font[0] = L'S';
+        renderer->dwrite_font[1] = L'e';
+        renderer->dwrite_font[2] = L'g';
+        renderer->dwrite_font[3] = L'o';
+        renderer->dwrite_font[4] = L'e';
+        renderer->dwrite_font[5] = L' ';
+        renderer->dwrite_font[6] = L'U';
+        renderer->dwrite_font[7] = L'I';
+        renderer->dwrite_font[8] = L'\0';
+        renderer->d2d_last_hr = S_OK;
+
+        D2D1_FACTORY_OPTIONS opts;
+        opts.debugLevel = D2D1_DEBUG_LEVEL_NONE;
+        HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                       &IID_ID2D1Factory, &opts, (void**)&renderer->d2d_factory);
+        if (SUCCEEDED(hr)) {
+            renderer->type = GT_RENDERER_D2D;
+            window->renderer = renderer;
+            // Le RT est créé paresseusement au premier dessin (gtD2DEnsureRT) :
+            // la fenêtre peut ne pas être encore affichée à cet instant.
+        }
+        // Échec (DLL absente, OOM) : reste sur GDI ? Non — retour NULL pour
+        // que l'appelant sache que le backend demandé est indisponible.
+        if (renderer->type != GT_RENDERER_D2D) {
+            free(renderer);
+            return NULL;
+        }
+        return renderer;
+    }
+#else
+    (void)type;  // LIBGT_NO_D2D : seul GDI existe
+#endif
+
+    window->renderer = renderer;
     return renderer;
 }
 
 // Détruit le renderer et libère ses ressources
 void gtDestroyRenderer(GtRenderer* renderer) {
     if (!renderer) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->window && renderer->window->renderer == renderer) {
+        renderer->window->renderer = NULL;
+    }
+    if (renderer->d2d_rt) {
+        if (renderer->d2d_drawing) {
+            // Frame en cours : clôture au mieux avant destruction
+            while (renderer->d2d_clip_depth > 0) {
+                ID2D1RenderTarget_PopAxisAlignedClip((ID2D1RenderTarget*)renderer->d2d_rt);
+                renderer->d2d_clip_depth--;
+            }
+            ID2D1RenderTarget_EndDraw((ID2D1RenderTarget*)renderer->d2d_rt, NULL, NULL);
+        }
+        ID2D1HwndRenderTarget_Release(renderer->d2d_rt);
+    }
+    gtD2DInvalidatePaint(&renderer->d2d);
+    for (int i = 0; i < renderer->dwrite_format_count; i++) {
+        if (renderer->dwrite_formats[i]) IDWriteTextFormat_Release(renderer->dwrite_formats[i]);
+    }
+    if (renderer->dwrite_factory) IDWriteFactory_Release(renderer->dwrite_factory);
+    if (renderer->d2d_factory) ID2D1Factory_Release(renderer->d2d_factory);
+#endif
     free(renderer);
+}
+
+GtRendererType gtRendererGetType(const GtRenderer* renderer) {
+    if (!renderer) return GT_RENDERER_GDI;
+    return renderer->type;
+}
+
+void gtRendererSetAntialias(GtRenderer* renderer, bool antialias) {
+    if (!renderer) return;
+#ifndef LIBGT_NO_D2D
+    renderer->d2d_antialias = antialias;
+    if (renderer->d2d_rt) {
+        ID2D1RenderTarget_SetAntialiasMode((ID2D1RenderTarget*)renderer->d2d_rt,
+                                           antialias ? D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
+                                                     : D2D1_ANTIALIAS_MODE_ALIASED);
+    }
+#else
+    (void)antialias;
+#endif
 }
 
 // Début de frame : prépare le backend pour le dessin
 // GDI : rien à faire (dessine direct dans framebuffer RAM)
+// D2D : BeginDraw immédiat (idempotent — les dessins window-level peuvent
+//       aussi démarrer la frame paresseusement sans Begin explicite)
 void gtRendererBegin(GtRenderer* renderer) {
-    (void)renderer;  // Évite warning "unused parameter"
+    if (!renderer) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        gtD2DBeginDraw(renderer);
+        return;
+    }
+#endif
 }
 
 // Fin de frame : présente le résultat à l'écran
 // GDI : appelle gtUpdateWindow (GetDC/StretchDIBits/ReleaseDC à chaque frame)
+// D2D : EndDraw (présent via DWM) — idempotent (double End sans effet)
 void gtRendererEnd(GtRenderer* renderer) {
     if (!renderer || !renderer->window) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        gtD2DEndFrame(renderer);
+        return;
+    }
+#endif
     gtUpdateWindow(renderer->window);
 }
+
+// ---------------------------------------------------------------------------
+// DISPATCHERS WINDOW-LEVEL D2D
+// (prototypes anticipés après struct GtWindow)
+// Retournent true si le dessin a été routé vers le GPU, false sinon (GDI).
+// Z-order préservé : tout passe par le même render target dans l'ordre
+// d'appel, la frame étant ouverte paresseusement au premier dessin.
+// ---------------------------------------------------------------------------
+#ifndef LIBGT_NO_D2D
+
+static GtRenderer* gtWindowGetD2D(GtWindow* win) {
+    if (!win || !win->renderer || win->renderer->type != GT_RENDERER_D2D) return NULL;
+    return win->renderer;
+}
+
+// Synchro du clip D2D avec le sommet de la pile de scissor renderer.
+// Le clip est en espace ÉCRAN : transform identité le temps du Push.
+static void gtD2DSyncClip(GtRenderer* r) {
+    if (!r->d2d_rt) return;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+    if (r->d2d_clip_depth > 0) {
+        ID2D1RenderTarget_PopAxisAlignedClip(rt);
+        r->d2d_clip_depth--;
+    }
+    const GtRendererScissorState* s = (r->scissor_stack_depth > 0)
+        ? &r->scissor_stack[r->scissor_stack_depth - 1] : NULL;
+    if (s && s->active) {
+        D2D1_RECT_F rect;
+        rect.left = (float)s->x;
+        rect.top = (float)s->y;
+        rect.right = rect.left + (float)s->w;
+        rect.bottom = rect.top + (float)s->h;
+        D2D1_MATRIX_3X2_F saved;
+        ID2D1RenderTarget_GetTransform(rt, &saved);
+        D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+        ID2D1RenderTarget_SetTransform(rt, &id);
+        ID2D1RenderTarget_PushAxisAlignedClip(rt, &rect, D2D1_ANTIALIAS_MODE_ALIASED);
+        ID2D1RenderTarget_SetTransform(rt, &saved);
+        r->d2d_clip_depth++;
+    }
+}
+
+static bool gtD2DWinClear(GtWindow* win, uint32_t color) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return false;
+    if (!gtD2DBeginDraw(r)) return false;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+    D2D1_COLOR_F c = gtD2DColor(color);
+    ID2D1RenderTarget_Clear(rt, &c);
+    return true;
+}
+
+static bool gtD2DWinDrawPixel(GtWindow* win, int x, int y, uint32_t color) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return false;
+    if (!gtD2DBeginDraw(r)) return false;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+    D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+    ID2D1RenderTarget_SetTransform(rt, &id);
+    gtD2DFillRect(rt, &r->d2d, (float)x, (float)y, 1.0f, 1.0f, color);
+    return true;
+}
+
+static bool gtD2DWinDrawRect(GtWindow* win, int x, int y, int w, int h, uint32_t color) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return false;
+    if (w <= 0 || h <= 0) return true;  // consommé, rien à dessiner (comme GDI)
+    if (!gtD2DBeginDraw(r)) return false;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+    D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+    ID2D1RenderTarget_SetTransform(rt, &id);
+    gtD2DFillRect(rt, &r->d2d, (float)x, (float)y, (float)w, (float)h, color);
+    return true;
+}
+
+static bool gtD2DWinDrawRectLines(GtWindow* win, int x, int y, int w, int h, uint32_t color) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return false;
+    if (w <= 0 || h <= 0) return true;
+    if (!gtD2DBeginDraw(r)) return false;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+    D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+    ID2D1RenderTarget_SetTransform(rt, &id);
+    // Inset 0.5 : le contour couvre les pixels x..x+w-1 comme le GDI
+    gtD2DFrameRect(rt, &r->d2d, (float)x + 0.5f, (float)y + 0.5f,
+                   (float)w - 1.0f, (float)h - 1.0f, color, 1.0f);
+    return true;
+}
+
+static bool gtD2DWinDrawLine(GtWindow* win, int x1, int y1, int x2, int y2, uint32_t color) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return false;
+    if (!gtD2DBeginDraw(r)) return false;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+    D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+    ID2D1RenderTarget_SetTransform(rt, &id);
+    gtD2DDrawLineSeg(rt, &r->d2d, (float)x1, (float)y1, (float)x2, (float)y2, color, 1.0f);
+    return true;
+}
+
+static bool gtD2DWinDrawCircle(GtWindow* win, int cx, int cy, int radius, uint32_t color) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return false;
+    if (radius < 0) return true;
+    if (!gtD2DBeginDraw(r)) return false;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+    D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+    ID2D1RenderTarget_SetTransform(rt, &id);
+    if (radius == 0) {
+        gtD2DFillRect(rt, &r->d2d, (float)cx, (float)cy, 1.0f, 1.0f, color);
+    } else {
+        // +0.5 : même diamètre apparent que le disque GDI (2*r+1 px)
+        gtD2DFillEllipse(rt, &r->d2d, (float)cx, (float)cy, (float)radius + 0.5f, color);
+    }
+    return true;
+}
+
+static bool gtD2DWinDrawCircleLines(GtWindow* win, int cx, int cy, int radius, uint32_t color) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return false;
+    if (radius < 0) return true;
+    if (!gtD2DBeginDraw(r)) return false;
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+    D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+    ID2D1RenderTarget_SetTransform(rt, &id);
+    if (radius == 0) {
+        gtD2DFillRect(rt, &r->d2d, (float)cx, (float)cy, 1.0f, 1.0f, color);
+    } else {
+        gtD2DStrokeEllipse(rt, &r->d2d, (float)cx, (float)cy, (float)radius + 0.5f, color, 1.0f);
+    }
+    return true;
+}
+
+static void gtD2DWindowSize(GtWindow* win, int new_width, int new_height) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return;
+    if (r->d2d_drawing) gtD2DEndFrame(r);  // Resize exige un EndDraw préalable
+    if (!r->d2d_rt) return;                // sera créé à la bonne taille au prochain dessin
+    D2D1_SIZE_U size;
+    size.width = (UINT32)(new_width > 0 ? new_width : 1);
+    size.height = (UINT32)(new_height > 0 ? new_height : 1);
+    HRESULT hr = ID2D1HwndRenderTarget_Resize(r->d2d_rt, &size);
+    if (FAILED(hr)) {
+        gtD2DInvalidatePaint(&r->d2d);
+        ID2D1HwndRenderTarget_Release(r->d2d_rt);
+        r->d2d_rt = NULL;  // recréation paresseuse au prochain dessin
+    }
+}
+
+static bool gtWindowD2DPresent(GtWindow* win) {
+    GtRenderer* r = gtWindowGetD2D(win);
+    if (!r) return false;
+    gtD2DEndFrame(r);
+    return true;
+}
+
+// Texte HQ (DirectWrite) ----------------------------------------------------
+
+static IDWriteFactory* gtD2DEnsureDWrite(GtRenderer* r) {
+    if (r->dwrite_factory) return r->dwrite_factory;
+    IDWriteFactory* f = NULL;
+    HRESULT hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory,
+                                     (IUnknown**)&f);
+    if (FAILED(hr)) return NULL;
+    r->dwrite_factory = f;
+    return f;
+}
+
+static IDWriteTextFormat* gtD2DGetTextFormat(GtRenderer* r, float font_px) {
+    for (int i = 0; i < r->dwrite_format_count; i++) {
+        if (r->dwrite_format_px[i] == font_px) return r->dwrite_formats[i];
+    }
+    int idx;
+    if (r->dwrite_format_count >= GT_D2D_MAX_FONT_FORMATS) {
+        idx = 0;  // cache plein : réutilise le premier slot
+    } else {
+        idx = r->dwrite_format_count;
+        IDWriteFactory* f = gtD2DEnsureDWrite(r);
+        if (!f) return NULL;
+        IDWriteTextFormat* fmt = NULL;
+        HRESULT hr = IDWriteFactory_CreateTextFormat(f, r->dwrite_font, NULL,
+                                                     DWRITE_FONT_WEIGHT_NORMAL,
+                                                     DWRITE_FONT_STYLE_NORMAL,
+                                                     DWRITE_FONT_STRETCH_NORMAL,
+                                                     font_px, L"en-US", &fmt);
+        if (FAILED(hr)) return NULL;
+        r->dwrite_formats[idx] = fmt;
+        r->dwrite_format_px[idx] = font_px;
+        r->dwrite_format_count++;
+    }
+    return r->dwrite_formats[idx];
+}
+
+void gtRendererSetHqFontName(GtRenderer* renderer, const char* font_name) {
+    if (!renderer || !font_name || !*font_name) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type != GT_RENDERER_D2D) return;
+    int wn = MultiByteToWideChar(CP_UTF8, 0, font_name, -1, renderer->dwrite_font, 63);
+    renderer->dwrite_font[(wn > 0) ? wn - 1 : 0] = 0;
+    // Invalide les formats cachés (changement de police)
+    for (int i = 0; i < renderer->dwrite_format_count; i++) {
+        if (renderer->dwrite_formats[i]) IDWriteTextFormat_Release(renderer->dwrite_formats[i]);
+        renderer->dwrite_formats[i] = NULL;
+    }
+    renderer->dwrite_format_count = 0;
+#else
+    (void)renderer; (void)font_name;
+#endif
+}
+
+void gtRendererDrawTextHq(GtRenderer* renderer, float x, float y, const char* text,
+                          float font_px, GtColor color) {
+    if (!renderer || !renderer->window || !text || !*text) return;
+    if (font_px <= 0.0f) font_px = 16.0f;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        IDWriteTextFormat* fmt = gtD2DGetTextFormat(renderer, font_px);
+        if (!fmt) return;
+        ID2D1SolidColorBrush* b = gtD2DGetBrush(rt, &renderer->d2d, color);
+        if (!b) return;
+        wchar_t wtext[512];
+        int wn = MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, 511);
+        if (wn <= 0) return;  // wtext[wn-1] = L'\0' déjà posé (-1 inclut le null)
+        // Texte HQ en espace écran (transform identité) — documenté.
+        D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+        ID2D1RenderTarget_SetTransform(rt, &id);
+        D2D1_RECT_F layout;
+        layout.left = x;
+        layout.top = y;
+        layout.right = (float)renderer->window->width;
+        layout.bottom = y + font_px * 1.7f;
+        ID2D1RenderTarget_DrawText(rt, wtext, (UINT32)(wn - 1), fmt, &layout,
+                                   (ID2D1Brush*)b,
+                                   D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        return;
+    }
+#endif
+    // Backend GDI : fallback police bitmap 8x8 à l'échelle font_px/8
+    gtDrawTextEx(renderer->window, (int)x, (int)y, text, color, font_px / 8.0f, 0, 0);
+}
+
+#endif // LIBGT_NO_D2D
+
+// Stubs quand le backend D2D est désactivé à la compilation
+#ifdef LIBGT_NO_D2D
+void gtRendererSetHqFontName(GtRenderer* renderer, const char* font_name) {
+    (void)renderer; (void)font_name;
+}
+void gtRendererDrawTextHq(GtRenderer* renderer, float x, float y, const char* text,
+                          float font_px, GtColor color) {
+    if (!renderer || !renderer->window || !text || !*text) return;
+    if (font_px <= 0.0f) font_px = 16.0f;
+    gtDrawTextEx(renderer->window, (int)x, (int)y, text, color, font_px / 8.0f, 0, 0);
+}
+#endif
 
 
 // Helpers internes au renderer.
@@ -2376,11 +3330,31 @@ static inline bool gtRendererClipLineScissor(const GtRenderer* renderer,
 
 void gtRendererClear(GtRenderer* renderer, GtColor color) {
     if (!renderer || !renderer->window) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        D2D1_COLOR_F c = gtD2DColor(color);
+        ID2D1RenderTarget_Clear(rt, &c);
+        return;
+    }
+#endif
     gtClearWindow(renderer->window, color);
 }
 
 void gtRendererDrawPixel(GtRenderer* renderer, int x, int y, GtColor color) {
     if (!renderer || !renderer->window) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        // Pixel local 1x1 sous la transform utilisateur (rotation gérée)
+        D2D1_MATRIX_3X2_F m = gtD2DMatrix(gtRendererGetCurrentTransform(renderer));
+        ID2D1RenderTarget_SetTransform(rt, &m);
+        gtD2DFillRect(rt, &renderer->d2d, (float)x, (float)y, 1.0f, 1.0f, color);
+        return;
+    }
+#endif
 
     GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)x, (float)y));
     int px = (int)p.x;
@@ -2393,6 +3367,17 @@ void gtRendererDrawPixel(GtRenderer* renderer, int x, int y, GtColor color) {
 
 void gtRendererDrawRect(GtRenderer* renderer, int x, int y, int w, int h, GtColor color) {
     if (!renderer || !renderer->window || w <= 0 || h <= 0) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        // Rect local sous la transform : rotation réelle (GDI dessine l'AABB)
+        D2D1_MATRIX_3X2_F m = gtD2DMatrix(gtRendererGetCurrentTransform(renderer));
+        ID2D1RenderTarget_SetTransform(rt, &m);
+        gtD2DFillRect(rt, &renderer->d2d, (float)x, (float)y, (float)w, (float)h, color);
+        return;
+    }
+#endif
 
     float tx = (float)x;
     float ty = (float)y;
@@ -2438,6 +3423,18 @@ void gtRendererDrawRect(GtRenderer* renderer, int x, int y, int w, int h, GtColo
 
 void gtRendererDrawRectLines(GtRenderer* renderer, int x, int y, int w, int h, GtColor color) {
     if (!renderer || !renderer->window || w <= 0 || h <= 0) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        D2D1_MATRIX_3X2_F m = gtD2DMatrix(gtRendererGetCurrentTransform(renderer));
+        ID2D1RenderTarget_SetTransform(rt, &m);
+        // Inset 0.5 : contour 1px couvrant x..x+w-1 comme le GDI
+        gtD2DFrameRect(rt, &renderer->d2d, (float)x + 0.5f, (float)y + 0.5f,
+                       (float)w - 1.0f, (float)h - 1.0f, color, 1.0f);
+        return;
+    }
+#endif
 
     float tx = (float)x;
     float ty = (float)y;
@@ -2475,6 +3472,19 @@ void gtRendererDrawRectLines(GtRenderer* renderer, int x, int y, int w, int h, G
 
 void gtRendererDrawLine(GtRenderer* renderer, int x1, int y1, int x2, int y2, GtColor color) {
     if (!renderer || !renderer->window) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        // Points transformés côté CPU, trait 1px écran (sémantique GDI)
+        GtVec2 p1 = gtRendererApplyTransform(renderer, gtVec2((float)x1, (float)y1));
+        GtVec2 p2 = gtRendererApplyTransform(renderer, gtVec2((float)x2, (float)y2));
+        D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+        ID2D1RenderTarget_SetTransform(rt, &id);
+        gtD2DDrawLineSeg(rt, &renderer->d2d, p1.x, p1.y, p2.x, p2.y, color, 1.0f);
+        return;
+    }
+#endif
 
     GtVec2 p1 = gtRendererApplyTransform(renderer, gtVec2((float)x1, (float)y1));
     GtVec2 p2 = gtRendererApplyTransform(renderer, gtVec2((float)x2, (float)y2));
@@ -2494,6 +3504,21 @@ void gtRendererDrawLine(GtRenderer* renderer, int x1, int y1, int x2, int y2, Gt
 
 void gtRendererDrawCircle(GtRenderer* renderer, int cx, int cy, int radius, GtColor color) {
     if (!renderer || !renderer->window || radius < 0) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        // Cercle local sous la transform : rayon respecte le scale (amélioration vs GDI)
+        D2D1_MATRIX_3X2_F m = gtD2DMatrix(gtRendererGetCurrentTransform(renderer));
+        ID2D1RenderTarget_SetTransform(rt, &m);
+        if (radius == 0) {
+            gtD2DFillRect(rt, &renderer->d2d, (float)cx, (float)cy, 1.0f, 1.0f, color);
+        } else {
+            gtD2DFillEllipse(rt, &renderer->d2d, (float)cx, (float)cy, (float)radius + 0.5f, color);
+        }
+        return;
+    }
+#endif
 
     GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)cx, (float)cy));
     int tcx = (int)p.x;
@@ -2506,6 +3531,20 @@ void gtRendererDrawCircle(GtRenderer* renderer, int cx, int cy, int radius, GtCo
 
 void gtRendererDrawCircleLines(GtRenderer* renderer, int cx, int cy, int radius, GtColor color) {
     if (!renderer || !renderer->window || radius < 0) return;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        D2D1_MATRIX_3X2_F m = gtD2DMatrix(gtRendererGetCurrentTransform(renderer));
+        ID2D1RenderTarget_SetTransform(rt, &m);
+        if (radius == 0) {
+            gtD2DFillRect(rt, &renderer->d2d, (float)cx, (float)cy, 1.0f, 1.0f, color);
+        } else {
+            gtD2DStrokeEllipse(rt, &renderer->d2d, (float)cx, (float)cy, (float)radius + 0.5f, color, 1.0f);
+        }
+        return;
+    }
+#endif
 
     GtVec2 p = gtRendererApplyTransform(renderer, gtVec2((float)cx, (float)cy));
     int tcx = (int)p.x;
@@ -2705,6 +3744,10 @@ void gtRendererSetScissorRect(GtRenderer* renderer, int x, int y, int w, int h) 
         scissor->h = h;
         scissor->active = (w > 0 && h > 0);
     }
+
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) gtD2DSyncClip(renderer);
+#endif
 }
 
 void gtRendererPushScissorRect(GtRenderer* renderer, int x, int y, int w, int h) {
@@ -2750,11 +3793,17 @@ void gtRendererPushScissorRect(GtRenderer* renderer, int x, int y, int w, int h)
     }
 
     renderer->scissor_stack_depth++;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) gtD2DSyncClip(renderer);
+#endif
 }
 
 void gtRendererPopScissorRect(GtRenderer* renderer) {
     if (!renderer || renderer->scissor_stack_depth == 0) return;
     renderer->scissor_stack_depth--;
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) gtD2DSyncClip(renderer);
+#endif
 }
 
 void gtRendererGetScissorRect(const GtRenderer* renderer,
@@ -2881,6 +3930,25 @@ void gtRendererDrawImage(GtRenderer* renderer, GtImage* image,
     uint32_t* img_pixels = gtImageGetPixels(image);
     if (!img_pixels || img_w <= 0 || img_h <= 0) return;
 
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if ((tint >> 24) == 0) return;  // invisible (comme le chemin GDI)
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        ID2D1Bitmap* bmp = gtD2DGetTintedBitmap(rt, &renderer->d2d, image, tint);
+        if (!bmp) return;
+        // Rect local sous la transform utilisateur (rotation réelle, vs AABB GDI)
+        D2D1_MATRIX_3X2_F m = gtD2DMatrix(gtRendererGetCurrentTransform(renderer));
+        ID2D1RenderTarget_SetTransform(rt, &m);
+        D2D1_RECT_F dst;
+        dst.left = (float)x; dst.top = (float)y;
+        dst.right = dst.left + (float)img_w; dst.bottom = dst.top + (float)img_h;
+        ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
+                                     D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL);
+        return;
+    }
+#endif
+
     float tx = (float)x;
     float ty = (float)y;
     float tw = (float)img_w;
@@ -2972,6 +4040,46 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
                            int x, int y, int w, int h,
                            float rot, GtVec2 origin,
                            bool flip_x, bool flip_y, GtColor tint) {
+#ifndef LIBGT_NO_D2D
+    if (renderer && renderer->type == GT_RENDERER_D2D) {
+        if (!image || w <= 0 || h <= 0 || (tint >> 24) == 0) return;
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        ID2D1Bitmap* bmp = gtD2DGetTintedBitmap(rt, &renderer->d2d, image, tint);
+        if (!bmp) return;
+
+        // Rect destination : (x,y) = point d'ancrage défini par origin
+        float dx = (float)x - origin.x * (float)w;
+        float dy = (float)y - origin.y * (float)h;
+
+        // M = user . T(anchor) . R(rot) . T(-anchor) . T(center) . S(flip) . T(-center)
+        // (ordre col-major : le flip s'applique d'abord, puis la rotation)
+        GtMat3 m = gtMat3Translate(dx, dy);
+        if (flip_x || flip_y) {
+            float fcx = dx + (float)w * 0.5f;
+            float fcy = dy + (float)h * 0.5f;
+            m = gtMat3Mul(m, gtMat3Translate(fcx, fcy));
+            m = gtMat3Mul(m, gtMat3Scale(flip_x ? -1.0f : 1.0f, flip_y ? -1.0f : 1.0f));
+            m = gtMat3Mul(m, gtMat3Translate(-fcx, -fcy));
+        }
+        if (rot != 0.0f) {
+            m = gtMat3Mul(m, gtMat3Translate((float)x, (float)y));
+            m = gtMat3Mul(m, gtMat3Rotate(rot));
+            m = gtMat3Mul(m, gtMat3Translate(-(float)x, -(float)y));
+        }
+        const GtMat3* user = gtRendererGetCurrentTransform(renderer);
+        GtMat3 total = user ? gtMat3Mul(*user, m) : m;
+
+        D2D1_MATRIX_3X2_F dm = gtD2DMatrix(&total);
+        ID2D1RenderTarget_SetTransform(rt, &dm);
+        D2D1_RECT_F dst;
+        dst.left = dx; dst.top = dy;
+        dst.right = dx + (float)w; dst.bottom = dy + (float)h;
+        ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
+                                     D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL);
+        return;
+    }
+#endif
     /* GDI renderer actuel : rotation/origine ne sont pas encore rasterisés.
      * flip_x/flip_y sont supportés (miroir du sampling source). */
     (void)rot;
@@ -3076,6 +4184,27 @@ void gtRendererDrawImageTransformed(GtRenderer* renderer,
     int img_h = gtImageGetHeight(image);
     if (img_w <= 0 || img_h <= 0) return;
 
+#ifndef LIBGT_NO_D2D
+    if (renderer->type == GT_RENDERER_D2D) {
+        if ((tint >> 24) == 0) return;
+        if (!gtD2DBeginDraw(renderer)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
+        ID2D1Bitmap* bmp = gtD2DGetTintedBitmap(rt, &renderer->d2d, image, tint);
+        if (!bmp) return;
+        // Vrai quad transformé (vs AABB à plat en GDI)
+        const GtMat3* user = gtRendererGetCurrentTransform(renderer);
+        GtMat3 total = user ? gtMat3Mul(*user, *model) : *model;
+        D2D1_MATRIX_3X2_F dm = gtD2DMatrix(&total);
+        ID2D1RenderTarget_SetTransform(rt, &dm);
+        D2D1_RECT_F dst;
+        dst.left = 0.0f; dst.top = 0.0f;
+        dst.right = (float)img_w; dst.bottom = (float)img_h;
+        ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
+                                     D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL);
+        return;
+    }
+#endif
+
     GtVec2 corners[4] = {
         gtMat3MulVec2(*model, gtVec2(0.0f, 0.0f)),
         gtMat3MulVec2(*model, gtVec2((float)img_w, 0.0f)),
@@ -3105,15 +4234,18 @@ void gtRendererDrawImageTransformed(GtRenderer* renderer,
 /* =========================================================================
 * IMPLÉMENTATION : BATCH RENDERING (2.1)
 * =========================================================================
-* Décision d'architecture (actée) : ce "batch renderer" est un command
-* buffer CPU rejoué au flush — le backend GDI ne bénéficie d'aucun
-* batching GPU réel. GtBatchVertex (champs x/y, u/v, color, radius, image_id,
-* prim_type, glyph) est le contrat à préserver : un futur backend Direct2D
-* pourra consommer ce même buffer nativement (rects/quads, ellipses,
-* glyphs) et obtenir là le vrai gain de perf. Le CPU ne pré-tesselle plus
-* (1 vertex par cercle, quads seulement pour rects/lignes/texte) ;
-* à réévaluer au moment de brancher D2D (tri par image, fusion du flush
-* avec l'API directe).
+* Architecture : ce "batch renderer" est un command buffer CPU, rejoué au
+* flush par le backend actif. GtBatchVertex (champs x/y, u/v, color, radius,
+* image_id, prim_type, glyph) est le contrat consommé par les deux backends :
+*   - GDI  : rastérisation CPU directe (gtBatchFlush).
+*   - D2D  : rejeu via le render target GPU (gtBatchFlushD2D) — ellipses
+*     natives, FillRectangle, DrawBitmap, atlas texte.
+* Le coût D2D reste ~350ns/primitive (API immédiate) : pour les charges
+* type particules au-delà de ~10k primitives/frame, un futur backend
+* D3D11 raw-quads (vertex buffer unique) supprimerait ce coût — le buffer
+* est déjà en forme pour ça (1 vertex/cercle, quads pré-transformés).
+* Reste à évaluer : tri par image_id/couleur pour minimiser les changements
+* d'état GPU.
 * ========================================================================= */
 
 #define GT_BATCH_MAX_TRANSFORM_STACK 32
@@ -3364,12 +4496,136 @@ void gtBatchEnd(GtBatchRenderer* batch) {
     batch->began = false;
 }
 
+#ifndef LIBGT_NO_D2D
+// Flush D2D : rejoue le command buffer via le render target GPU.
+// Les vertices sont pré-transformés en espace écran (à l'ajout) → transform
+// identité. Le scissor batch suit la même sémantique que le flush GDI :
+// l'état FINAL de la pile s'applique à toutes les primitives du flush.
+static void gtBatchFlushD2D(GtBatchRenderer* batch, GtRenderer* r) {
+    if (!gtD2DBeginDraw(r)) {
+        batch->vertex_count = 0;
+        batch->image_count = 0;
+        batch->flush_count++;
+        return;
+    }
+    ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+
+    D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+    ID2D1RenderTarget_SetTransform(rt, &id);
+
+    bool clip_pushed = false;
+    if (batch->scissor_stack_depth > 0) {
+        GtBatchScissorState* s = &batch->scissor_stack[batch->scissor_stack_depth - 1];
+        if (s->active) {
+            D2D1_RECT_F rect;
+            rect.left = (float)s->x;
+            rect.top = (float)s->y;
+            rect.right = rect.left + (float)s->w;
+            rect.bottom = rect.top + (float)s->h;
+            ID2D1RenderTarget_PushAxisAlignedClip(rt, &rect, D2D1_ANTIALIAS_MODE_ALIASED);
+            r->d2d_clip_depth++;
+            clip_pushed = true;
+        }
+    }
+
+    for (int i = 0; i < batch->vertex_count; ) {
+        GtBatchVertex* v = &batch->vertices[i];
+        GtImage* img = (v->image_id >= 0 && v->image_id < batch->image_count)
+            ? batch->images[v->image_id] : NULL;
+
+        switch (v->prim_type) {
+            case GT_BATCH_RECT: {
+                if (i + 5 < batch->vertex_count) {
+                    float x = v[0].x;
+                    float y = v[0].y;
+                    float w = v[1].x - v[0].x;
+                    float h = v[2].y - v[0].y;
+                    if (w > 0.0f && h > 0.0f) {
+                        if (img) {
+                            ID2D1Bitmap* bmp = gtD2DGetTintedBitmap(rt, &r->d2d, img, v[0].color);
+                            if (bmp) {
+                                D2D1_RECT_F dst;
+                                dst.left = x; dst.top = y;
+                                dst.right = x + w; dst.bottom = y + h;
+                                ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
+                                                             D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL);
+                            }
+                        } else {
+                            gtD2DFillRect(rt, &r->d2d, x, y, w, h, v[0].color);
+                        }
+                    }
+                }
+                i += 6;
+                batch->draw_calls++;
+                break;
+            }
+            case GT_BATCH_CIRCLE: {
+                int radius = (int)v[0].radius;
+                if (radius > 0) {
+                    gtD2DFillEllipse(rt, &r->d2d, v[0].x, v[0].y, (float)radius + 0.5f, v[0].color);
+                }
+                i += 1;
+                batch->draw_calls++;
+                break;
+            }
+            case GT_BATCH_LINE: {
+                if (i + 3 < batch->vertex_count) {
+                    gtD2DDrawLineSeg(rt, &r->d2d, v[0].x, v[0].y, v[2].x, v[2].y, v[0].color, 1.0f);
+                }
+                i += 4;
+                batch->draw_calls++;
+                break;
+            }
+            case GT_BATCH_TEXT: {
+                if (i + 5 < batch->vertex_count && v[0].glyph >= 32 && v[0].glyph <= 126) {
+                    float x = v[0].x;
+                    float y = v[0].y;
+                    float w = v[1].x - v[0].x;
+                    float h = v[2].y - v[0].y;
+                    if (w > 0.0f && h > 0.0f) {
+                        ID2D1Bitmap* atlas = gtD2DGetFontAtlas(rt, &r->d2d, v[0].color);
+                        if (atlas) {
+                            float scale = (v[0].radius > 0.0f) ? v[0].radius : h / 8.0f;
+                            gtD2DDrawGlyph(rt, &r->d2d, atlas, x, y, (char)v[0].glyph, scale);
+                        }
+                    }
+                }
+                i += 6;
+                batch->draw_calls++;
+                break;
+            }
+            default:
+                i++;
+                break;
+        }
+    }
+
+    if (clip_pushed) {
+        ID2D1RenderTarget_PopAxisAlignedClip(rt);
+        r->d2d_clip_depth--;
+    }
+
+    batch->vertex_count = 0;
+    batch->image_count = 0;
+    batch->flush_count++;
+}
+#endif // LIBGT_NO_D2D
+
 void gtBatchFlush(GtBatchRenderer* batch) {
     if (!batch || !batch->began || batch->vertex_count == 0) return;
-    
+
     GtRenderer* r = batch->renderer;
-    if (!r || r->type != GT_RENDERER_GDI) return;
-    
+    if (!r) return;
+
+#ifndef LIBGT_NO_D2D
+    if (r->type == GT_RENDERER_D2D) {
+        gtBatchFlushD2D(batch, r);
+        return;
+    }
+#endif
+
+    if (r->type != GT_RENDERER_GDI) return;
+
     GtWindow* win = r->window;
     if (!win) return;
     
@@ -3747,6 +5003,9 @@ GtImage* gtLoadImage(const char* filepath, int* out_width, int* out_height) {
 
 void gtFreeImage(GtImage* image) {
     if (!image) return;
+#ifndef LIBGT_NO_D2D
+    if (image->d2d_bitmap) ID2D1Bitmap_Release((ID2D1Bitmap*)image->d2d_bitmap);
+#endif
     if (image->pixels) free(image->pixels);
     free(image);
 }
@@ -3822,7 +5081,22 @@ void gtDrawText(GtWindow* window, int x, int y, const char* text, uint32_t color
 
 void gtDrawTextEx(GtWindow* window, int x, int y, const char* text, uint32_t color,
                   float scale, int spacing, int wrap_width) {
-    if (!window || !window->buffer || !text) return;
+    if (!window || !text) return;
+#ifndef LIBGT_NO_D2D
+    // Mode D2D : texte via l'atlas GPU (z-order = ordre d'appel)
+    if (window->renderer && window->renderer->type == GT_RENDERER_D2D) {
+        GtRenderer* r = window->renderer;
+        if (!gtD2DBeginDraw(r)) return;
+        ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
+        ID2D1Bitmap* atlas = gtD2DGetFontAtlas(rt, &r->d2d, color);
+        if (!atlas) return;
+        D2D1_MATRIX_3X2_F id = gtD2DMatrix(NULL);
+        ID2D1RenderTarget_SetTransform(rt, &id);
+        gtD2DDrawTextRun(rt, &r->d2d, atlas, text, (float)x, (float)y, scale, spacing, wrap_width);
+        return;
+    }
+#endif
+    if (!window->buffer) return;
     if (scale <= 0.0f) scale = 1.0f;
 
     int cur_x = x;
