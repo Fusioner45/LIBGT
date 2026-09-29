@@ -100,6 +100,22 @@ int       gtGetWidth(GtWindow* window);
 int       gtGetHeight(GtWindow* window);
 
 /* =========================================================================
+* DIAGNOSTICS D'ERREURS
+* =========================================================================
+* La lib retourne NULL/valeurs par défaut en cas d'échec (style C). Pour
+* savoir POURQUOI, deux mécanismes complémentaires :
+*   - gtGetLastError() : le dernier message d'erreur de la lib (chaîne statique)
+*   - gtSetErrorCallback() : notification immédiate (log console, crash report...)
+* ========================================================================= */
+typedef void (*GtErrorCallback)(const char* message, void* user_data);
+
+// Installe un callback appelé à chaque erreur interne (NULL pour retirer)
+void gtSetErrorCallback(GtErrorCallback callback, void* user_data);
+
+// Dernier message d'erreur enregistré par la lib ("" si aucun depuis le départ)
+const char* gtGetLastError(void);
+
+/* =========================================================================
 * API PUBLIQUE - PRIMITIVES DE DESSIN 2D (sur GtWindow directement)
 * =========================================================================
 * Ces fonctions dessinent directement dans le framebuffer de la fenêtre.
@@ -233,15 +249,16 @@ static inline GtVec2 gtMat3MulDir(GtMat3 m, GtVec2 v) {
     return gtVec2(m.m[0]*v.x + m.m[3]*v.y, m.m[1]*v.x + m.m[4]*v.y);
 }
 
-// Inverse d'une matrice 2D affine (translation + rotation + scale, sans shear/projection)
-// Retourne identité si matrice non-inversible (determinant ~ 0)
-static inline GtMat3 gtMat3Inverse(GtMat3 m) {
+// Tente l'inversion d'une matrice 2D affine (translation + rotation + scale).
+// Retourne false si la matrice est non inversible (|det| ~ 0) SANS toucher
+// *out — permet de détecter l'échec au lieu de le subir silencieusement.
+static inline bool gtMat3TryInverse(GtMat3 m, GtMat3* out) {
     // Sous-matrice 2x2 linéaire
     float a = m.m[0], b = m.m[3];
     float c = m.m[1], d = m.m[4];
     float tx = m.m[6], ty = m.m[7];
     float det = a*d - b*c;
-    if (fabsf(det) < 1e-6f) return gtMat3Identity();
+    if (fabsf(det) < 1e-6f) return false;
     float inv_det = 1.0f / det;
     GtMat3 r;
     r.m[0] =  d * inv_det;
@@ -251,6 +268,16 @@ static inline GtMat3 gtMat3Inverse(GtMat3 m) {
     r.m[6] = (b*ty - d*tx) * inv_det;
     r.m[7] = (c*tx - a*ty) * inv_det;
     r.m[2] = 0; r.m[5] = 0; r.m[8] = 1;
+    if (out) *out = r;
+    return true;
+}
+
+// Inverse d'une matrice 2D affine (translation + rotation + scale, sans shear/projection)
+// ATTENTION : si la matrice est non inversible (déterminant ~ 0), retourne
+// l'IDENTITÉ silencieusement — utiliser gtMat3TryInverse pour détecter l'échec.
+static inline GtMat3 gtMat3Inverse(GtMat3 m) {
+    GtMat3 r;
+    if (!gtMat3TryInverse(m, &r)) return gtMat3Identity();
     return r;
 }
 
@@ -285,11 +312,23 @@ typedef struct GtCamera {
     int viewport_h;     // Hauteur viewport (pixels écran)
     GtMat3 view_matrix;     // World -> Screen (mis à jour par gtCameraUpdate)
     GtMat3 inv_view_matrix; // Screen -> World (mis à jour par gtCameraUpdate)
+
+    // Cache de mise à jour (lazy) — géré par la lib, ne pas modifier.
+    // Permet de détecter les écritures directes dans position/rotation/zoom/
+    // viewport SANS appeler gtCameraUpdate : les accesseurs recalent alors
+    // les matrices automatiquement (plus de résultats silencieusement faux).
+    GtVec2 _cache_pos;
+    float  _cache_rot;
+    float  _cache_zoom;
+    int    _cache_vpw;
+    int    _cache_vph;
+    bool   _cache_valid;
 } GtCamera;
 
 // Crée une caméra centrée sur (0,0) avec zoom 1.0
 static inline GtCamera gtCameraCreate(GtVec2 position, float zoom, int viewport_w, int viewport_h) {
-    GtCamera cam = { position, 0.0f, zoom, viewport_w, viewport_h, {{0}}, {{0}} };
+    GtCamera cam = { position, 0.0f, zoom, viewport_w, viewport_h, {{0}}, {{0}},
+                     {0, 0}, 0.0f, 0.0f, 0, 0, false };
     return cam;
 }
 
@@ -308,20 +347,43 @@ static inline void gtCameraUpdate(GtCamera* cam) {
     // M = center * flip_y * scale * rot * trans
     cam->view_matrix = gtMat3Mul(center, gtMat3Mul(flip_y, gtMat3Mul(scale, gtMat3Mul(rot, trans))));
     cam->inv_view_matrix = gtMat3Inverse(cam->view_matrix);
+
+    cam->_cache_pos = cam->position;
+    cam->_cache_rot = cam->rotation;
+    cam->_cache_zoom = cam->zoom;
+    cam->_cache_vpw = cam->viewport_w;
+    cam->_cache_vph = cam->viewport_h;
+    cam->_cache_valid = true;
+}
+
+// Recale les matrices si la caméra a été modifiée sans gtCameraUpdate
+// (écritures directes dans les champs). No-op si tout est à jour.
+static inline void gtCameraEnsureUpdated(const GtCamera* cam_const) {
+    GtCamera* cam = (GtCamera*)cam_const;  // ne touche qu'au cache interne
+    if (!cam) return;
+    if (!cam->_cache_valid ||
+        cam->_cache_pos.x != cam->position.x || cam->_cache_pos.y != cam->position.y ||
+        cam->_cache_rot != cam->rotation || cam->_cache_zoom != cam->zoom ||
+        cam->_cache_vpw != cam->viewport_w || cam->_cache_vph != cam->viewport_h) {
+        gtCameraUpdate(cam);
+    }
 }
 
 // Convertit coordonnées monde -> écran (pixels)
 static inline GtVec2 gtCameraWorldToScreen(const GtCamera* cam, GtVec2 world) {
+    gtCameraEnsureUpdated(cam);
     return gtMat3MulVec2(cam->view_matrix, world);
 }
 
 // Convertit coordonnées écran -> monde
 static inline GtVec2 gtCameraScreenToWorld(const GtCamera* cam, GtVec2 screen) {
+    gtCameraEnsureUpdated(cam);
     return gtMat3MulVec2(cam->inv_view_matrix, screen);
 }
 
 // Récupère la matrice view-projection combinée pour le renderer
 static inline GtMat3 gtCameraGetViewProj(const GtCamera* cam) {
+    gtCameraEnsureUpdated(cam);
     return cam->view_matrix;
 }
 
@@ -425,9 +487,9 @@ bool gtWasMouseButtonPressed(GtWindow* window, int button);
 // Vérifie si un bouton souris vient d'être relâché CETTE frame
 bool gtWasMouseButtonReleased(GtWindow* window, int button);
 
-// Récupère le delta de la molette souris depuis la dernière frame
-// Positif = scroll vers le haut (loin de l'utilisateur), Négatif = scroll vers le bas
-// Remet à zéro après lecture (consommer l'événement)
+// Récupère le delta de la molette souris CETTE frame (stable : plusieurs
+// lectures par frame retournent la même valeur ; vidangé au prochain appel
+// de gtEventsWindow). Positif = scroll vers le haut (loin de l'utilisateur).
 int gtGetMouseWheelDelta(GtWindow* window);
 
 // Récupère les caractères tapés au clavier CETTE frame (WM_CHAR, via TranslateMessage).
@@ -1075,6 +1137,33 @@ void             gtInputSetVibration(int player_index, float left_motor, float r
 // On accepte ERROR_CLASS_ALREADY_EXISTS lors des créations suivantes.
 
 /* -------------------------------------------------------------------------
+* DIAGNOSTICS D'ERREURS (last-error + callback optionnel)
+* ------------------------------------------------------------------------- */
+static char g_gtLastError[256] = {0};
+static GtErrorCallback g_gtErrorCallback = NULL;
+static void* g_gtErrorUserData = NULL;
+
+void gtSetErrorCallback(GtErrorCallback callback, void* user_data) {
+    g_gtErrorCallback = callback;
+    g_gtErrorUserData = user_data;
+}
+
+const char* gtGetLastError(void) {
+    return g_gtLastError;
+}
+
+// Enregistre le dernier message d'erreur et notifie le callback éventuel
+static void gtReportError(const char* fmt, ...) {
+    char buffer[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    strcpy(g_gtLastError, buffer);  // borné par vsnprintf
+    if (g_gtErrorCallback) g_gtErrorCallback(buffer, g_gtErrorUserData);
+}
+
+/* -------------------------------------------------------------------------
 * STB_IMAGE - Chargement d'images (PNG, BMP, JPG, TGA, PSD, GIF, HDR, PIC)
 * -------------------------------------------------------------------------
 * Implémentation intégrée (header-only) - zéro dépendance externe.
@@ -1303,6 +1392,124 @@ static const uint8_t gt_font8x8[95 * 8] = {
     0x00, 0x00, 0x76, 0xDC, 0x00, 0x00, 0x00, 0x00,
 };
 
+// Glyphes accentues (CP-1252) : accent compresse sur les lignes 0-1, lettre
+// sur les lignes 2-7 (cedille sous la lettre pour c). Style coherent avec
+// gt_font8x8. Index globaux 95..126 (cf. gtGlyphIndexForCode).
+static const uint8_t gt_font8x8_ext[32 * 8] = {
+    // 95 A grave
+    0x08, 0x10, 0x18, 0x66, 0x66, 0x7E, 0x66, 0x66,
+    // 96 A circonflexe
+    0x10, 0x38, 0x18, 0x66, 0x66, 0x7E, 0x66, 0x66,
+    // 97 A trema
+    0x24, 0x00, 0x18, 0x66, 0x66, 0x7E, 0x66, 0x66,
+    // 98 C cedille
+    0x3C, 0x66, 0x60, 0x60, 0x60, 0x3C, 0x10, 0x20,
+    // 99 E aigu
+    0x20, 0x10, 0x7E, 0x60, 0x7C, 0x60, 0x60, 0x7E,
+    // 100 E grave
+    0x08, 0x10, 0x7E, 0x60, 0x7C, 0x60, 0x60, 0x7E,
+    // 101 E circonflexe
+    0x10, 0x38, 0x7E, 0x60, 0x7C, 0x60, 0x60, 0x7E,
+    // 102 E trema
+    0x24, 0x00, 0x7E, 0x60, 0x7C, 0x60, 0x60, 0x7E,
+    // 103 I circonflexe
+    0x10, 0x38, 0x3C, 0x18, 0x18, 0x18, 0x18, 0x3C,
+    // 104 I trema
+    0x24, 0x00, 0x3C, 0x18, 0x18, 0x18, 0x18, 0x3C,
+    // 105 O circonflexe
+    0x10, 0x38, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x3C,
+    // 106 O trema
+    0x24, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x3C,
+    // 107 U grave
+    0x08, 0x10, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C,
+    // 108 U circonflexe
+    0x10, 0x38, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C,
+    // 109 U trema
+    0x24, 0x00, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C,
+    // 110 a grave
+    0x08, 0x10, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E,
+    // 111 a circonflexe
+    0x10, 0x38, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E,
+    // 112 a trema
+    0x24, 0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E,
+    // 113 c cedille
+    0x00, 0x3C, 0x66, 0x60, 0x66, 0x3C, 0x10, 0x20,
+    // 114 e aigu
+    0x20, 0x10, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C,
+    // 115 e grave
+    0x08, 0x10, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C,
+    // 116 e circonflexe
+    0x10, 0x38, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C,
+    // 117 e trema
+    0x24, 0x00, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C,
+    // 118 i circonflexe
+    0x10, 0x38, 0x38, 0x18, 0x18, 0x18, 0x18, 0x3C,
+    // 119 i trema
+    0x00, 0x24, 0x38, 0x18, 0x18, 0x18, 0x18, 0x3C,
+    // 120 o circonflexe
+    0x10, 0x38, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x3C,
+    // 121 o trema
+    0x24, 0x00, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x3C,
+    // 122 u grave
+    0x08, 0x10, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3E,
+    // 123 u circonflexe
+    0x10, 0x38, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3E,
+    // 124 u trema
+    0x24, 0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3E,
+    // 125 guillemet ouvrant
+    0x00, 0x00, 0x24, 0x12, 0x24, 0x00, 0x00, 0x00,
+    // 126 guillemet fermant
+    0x00, 0x00, 0x24, 0x48, 0x24, 0x00, 0x00, 0x00,
+};
+
+// Nombre total de glyphes rendables (ASCII + accents)
+#define GT_FONT_GLYPH_COUNT 127
+
+// Index de glyphe pour un code CP-1252 : 0-94 = ASCII, 95-126 = accents, -1 = ignore
+static int gtGlyphIndexForCode(int code) {
+    if (code >= 32 && code <= 126) return code - 32;
+    switch (code) {
+        case 0xC0: return 95;  case 0xC2: return 96;  case 0xC4: return 97;
+        case 0xC7: return 98;  case 0xC9: return 99;  case 0xC8: return 100;
+        case 0xCA: return 101; case 0xCB: return 102; case 0xCE: return 103;
+        case 0xCF: return 104; case 0xD4: return 105; case 0xD6: return 106;
+        case 0xD9: return 107; case 0xDB: return 108; case 0xDC: return 109;
+        case 0xE0: return 110; case 0xE2: return 111; case 0xE4: return 112;
+        case 0xE7: return 113; case 0xE9: return 114; case 0xE8: return 115;
+        case 0xEA: return 116; case 0xEB: return 117; case 0xEE: return 118;
+        case 0xEF: return 119; case 0xF4: return 120; case 0xF6: return 121;
+        case 0xF9: return 122; case 0xFB: return 123; case 0xFC: return 124;
+        case 0xAB: return 125; case 0xBB: return 126;
+        default: return -1;
+    }
+}
+
+// Donnees 8 octets du glyphe d'index donne (NULL si hors plage)
+static const uint8_t* gtFontGlyphData(int index) {
+    if (index < 0 || index >= GT_FONT_GLYPH_COUNT) return NULL;
+    if (index < 95) return &gt_font8x8[index * 8];
+    return &gt_font8x8_ext[(index - 95) * 8];
+}
+
+// Decode le prochain caractere logique d'une chaine : gere l'UTF-8 2 octets
+// (U+00A0..U+00FF, accents latins) en le convertissant en code CP-1252
+// equivalent, et laisse passer les octets hauts directs (WM_CHAR CP-1252).
+// Retourne le code 0-255, ou -1 en fin de chaine. Avance *p.
+static int gtTextNextGlyph(const char** p) {
+    const unsigned char* u = (const unsigned char*)*p;
+    if (!u[0]) return -1;
+    if (u[0] == 0xC3 && u[1] >= 0x80 && u[1] <= 0xBF) {  // U+00C0..U+00FF
+        *p += 2;
+        return 0xC0 + (u[1] & 0x3F);
+    }
+    if (u[0] == 0xC2 && u[1] >= 0x80 && u[1] <= 0xBF) {  // U+00A0..U+00BF
+        *p += 2;
+        return 0x80 + (u[1] & 0x3F);
+    }
+    (*p)++;
+    return u[0];
+}
+
 /* -------------------------------------------------------------------------
 * STRUCTURE INTERNE DE FENÊTRE (GtWindow)
 * -------------------------------------------------------------------------
@@ -1326,9 +1533,11 @@ struct GtWindow {
     struct GtRenderer* renderer;
 
     bool keys[256];              // État clavier : true = enfoncée (index = code VK)
-    bool keys_prev[256];         // État clavier frame précédente (pour edge detection)
+    uint8_t key_pressed_count[256];  // Appuis FRAIS cette frame (hors auto-repeat) —
+    uint8_t key_released_count[256]; // vidés au début de chaque gtEventsWindow
     bool mouse_buttons[3];       // État souris : [0]=gauche, [1]=droit, [2]=milieu
-    bool mouse_buttons_prev[3];  // État souris frame précédente (pour edge detection)
+    uint8_t mouse_pressed_count[3];  // Clics frais cette frame (détecte down+up
+    uint8_t mouse_released_count[3]; // rapide entre deux frames, contrairement à un booléen)
     int  mouse_x;                // Position X souris relative zone cliente
     int  mouse_y;                // Position Y souris relative zone cliente
     int  mouse_wheel_delta;      // Delta molette accumulé cette frame (reset après lecture)
@@ -1595,20 +1804,37 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     switch (msg) {
     // ===== CLAVIER =====
     case WM_KEYDOWN:      // Touche enfoncée (répétition auto si maintenue)
-        if (win && wParam < 256) win->keys[wParam] = true;
+        if (win && wParam < 256) {
+            win->keys[wParam] = true;
+            // Bit 30 de lParam = auto-repeat : ne compte que les appuis FRAIS
+            if (!(lParam & (1u << 30)) && win->key_pressed_count[wParam] < 255)
+                win->key_pressed_count[wParam]++;
+        }
         break;
 
     case WM_SYSKEYDOWN:   // Touche système (Alt+...) enfoncée
-        if (win && wParam < 256) win->keys[wParam] = true;
+        if (win && wParam < 256) {
+            win->keys[wParam] = true;
+            if (!(lParam & (1u << 30)) && win->key_pressed_count[wParam] < 255)
+                win->key_pressed_count[wParam]++;
+        }
         // Laisser DefWindowProc gérer les raccourcis système (notamment Alt+F4).
         return DefWindowProcA(hwnd, msg, wParam, lParam);
 
     case WM_KEYUP:        // Touche relâchée
-        if (win && wParam < 256) win->keys[wParam] = false;
+        if (win && wParam < 256) {
+            win->keys[wParam] = false;
+            if (win->key_released_count[wParam] < 255)
+                win->key_released_count[wParam]++;
+        }
         break;
 
     case WM_SYSKEYUP:     // Touche système (Alt+...) relâchée
-        if (win && wParam < 256) win->keys[wParam] = false;
+        if (win && wParam < 256) {
+            win->keys[wParam] = false;
+            if (win->key_released_count[wParam] < 255)
+                win->key_released_count[wParam]++;
+        }
         return DefWindowProcA(hwnd, msg, wParam, lParam);
 
     case WM_CHAR:         // Caractère tapé (généré par TranslateMessage depuis WM_KEYDOWN)
@@ -1624,6 +1850,8 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     case WM_LBUTTONDOWN:  // Clic gauche
         if (win) {
             win->mouse_buttons[GT_MOUSE_BUTTON_LEFT] = true;
+            if (win->mouse_pressed_count[GT_MOUSE_BUTTON_LEFT] < 255)
+                win->mouse_pressed_count[GT_MOUSE_BUTTON_LEFT]++;
             if (GetCapture() != hwnd) SetCapture(hwnd);
         }
         break;
@@ -1631,6 +1859,8 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     case WM_LBUTTONUP:    // Relâche gauche
         if (win) {
             win->mouse_buttons[GT_MOUSE_BUTTON_LEFT] = false;
+            if (win->mouse_released_count[GT_MOUSE_BUTTON_LEFT] < 255)
+                win->mouse_released_count[GT_MOUSE_BUTTON_LEFT]++;
             if (!win->mouse_buttons[GT_MOUSE_BUTTON_LEFT] &&
                 !win->mouse_buttons[GT_MOUSE_BUTTON_RIGHT] &&
                 !win->mouse_buttons[GT_MOUSE_BUTTON_MIDDLE] &&
@@ -1643,6 +1873,8 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     case WM_RBUTTONDOWN:  // Clic droit
         if (win) {
             win->mouse_buttons[GT_MOUSE_BUTTON_RIGHT] = true;
+            if (win->mouse_pressed_count[GT_MOUSE_BUTTON_RIGHT] < 255)
+                win->mouse_pressed_count[GT_MOUSE_BUTTON_RIGHT]++;
             if (GetCapture() != hwnd) SetCapture(hwnd);
         }
         break;
@@ -1650,6 +1882,8 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     case WM_RBUTTONUP:
         if (win) {
             win->mouse_buttons[GT_MOUSE_BUTTON_RIGHT] = false;
+            if (win->mouse_released_count[GT_MOUSE_BUTTON_RIGHT] < 255)
+                win->mouse_released_count[GT_MOUSE_BUTTON_RIGHT]++;
             if (!win->mouse_buttons[GT_MOUSE_BUTTON_LEFT] &&
                 !win->mouse_buttons[GT_MOUSE_BUTTON_RIGHT] &&
                 !win->mouse_buttons[GT_MOUSE_BUTTON_MIDDLE] &&
@@ -1662,6 +1896,8 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     case WM_MBUTTONDOWN:  // Clic molette
         if (win) {
             win->mouse_buttons[GT_MOUSE_BUTTON_MIDDLE] = true;
+            if (win->mouse_pressed_count[GT_MOUSE_BUTTON_MIDDLE] < 255)
+                win->mouse_pressed_count[GT_MOUSE_BUTTON_MIDDLE]++;
             if (GetCapture() != hwnd) SetCapture(hwnd);
         }
         break;
@@ -1669,6 +1905,8 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     case WM_MBUTTONUP:
         if (win) {
             win->mouse_buttons[GT_MOUSE_BUTTON_MIDDLE] = false;
+            if (win->mouse_released_count[GT_MOUSE_BUTTON_MIDDLE] < 255)
+                win->mouse_released_count[GT_MOUSE_BUTTON_MIDDLE]++;
             if (!win->mouse_buttons[GT_MOUSE_BUTTON_LEFT] &&
                 !win->mouse_buttons[GT_MOUSE_BUTTON_RIGHT] &&
                 !win->mouse_buttons[GT_MOUSE_BUTTON_MIDDLE] &&
@@ -1771,7 +2009,6 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_CANCELMODE:   // Annulation mode (ex: menu ouvert, perte capture)
             if (win) {
                 memset(win->mouse_buttons, 0, sizeof(win->mouse_buttons));
-                memset(win->mouse_buttons_prev, 0, sizeof(win->mouse_buttons_prev));
                 if (GetCapture() == hwnd) ReleaseCapture();
             }
             break;
@@ -1779,7 +2016,6 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_CAPTURECHANGED: // Capture perdue (autre fenêtre l'a prise)
             if (win) {
                 memset(win->mouse_buttons, 0, sizeof(win->mouse_buttons));
-                memset(win->mouse_buttons_prev, 0, sizeof(win->mouse_buttons_prev));
                 win->mouse_tracking = false;
             }
             break;
@@ -1787,9 +2023,7 @@ static LRESULT CALLBACK GtWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_KILLFOCUS:    // Fenêtre perd le focus clavier
             if (win) {
                 memset(win->keys, 0, sizeof(win->keys));            // Relâche toutes touches
-                memset(win->keys_prev, 0, sizeof(win->keys_prev));  // Reset prev aussi
                 memset(win->mouse_buttons, 0, sizeof(win->mouse_buttons)); // Relâche souris
-                memset(win->mouse_buttons_prev, 0, sizeof(win->mouse_buttons_prev));
                 win->mouse_x = -1;  // Souris considérée comme hors fenêtre
                 win->mouse_y = -1;
                 win->mouse_wheel_delta = 0;
@@ -1843,31 +2077,44 @@ static bool gtRegisterWindowClass(HINSTANCE hInstance) {
 // Retourne : pointeur GtWindow* opaque, ou NULL si erreur
 GtWindow* gtCreateWindow(const char* title, int width, int height) {
     // Validation basique des paramètres.
-    if (!title || width <= 0 || height <= 0) return NULL;
+    if (!title || width <= 0 || height <= 0) {
+        gtReportError("gtCreateWindow : parametres invalides (titre=%p, %dx%d)",
+                      (void*)title, width, height);
+        return NULL;
+    }
     // Protection contre overflow size_t (width * height * 4 bytes)
-    if ((size_t)width > SIZE_MAX / (size_t)height / sizeof(uint32_t)) return NULL;
+    if ((size_t)width > SIZE_MAX / (size_t)height / sizeof(uint32_t)) {
+        gtReportError("gtCreateWindow : dimensions trop grandes (%dx%d)", width, height);
+        return NULL;
+    }
 
     // Alloue la structure fenêtre (zéro-initialisée via calloc)
     GtWindow* win = (GtWindow*)calloc(1, sizeof(GtWindow));
-    if (!win) return NULL;
+    if (!win) {
+        gtReportError("gtCreateWindow : allocation GtWindow OOM");
+        return NULL;
+    }
 
     win->width = width;
     win->height = height;
     win->should_close = false;
     win->hInstance = GetModuleHandle(NULL);  // Instance du processus courant
     if (!win->hInstance) {
+        gtReportError("gtCreateWindow : GetModuleHandle a echoue");
         free(win);
         return NULL;
     }
 
     // Enregistre la classe fenêtre Win32 si nécessaire.
     if (!gtRegisterWindowClass(win->hInstance)) {
+        gtReportError("gtCreateWindow : enregistrement de la classe fenetre echoue");
         free(win);
         return NULL;
     }
     // Calcule la taille fenêtre complète (avec bordures/titre) depuis zone cliente
     RECT rect = {0, 0, width, height};
     if (!AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE)) {
+        gtReportError("gtCreateWindow : AdjustWindowRect a echoue");
         free(win);
         return NULL;
     }
@@ -1885,6 +2132,8 @@ GtWindow* gtCreateWindow(const char* title, int width, int height) {
     );
 
     if (!win->hwnd) {
+        gtReportError("gtCreateWindow : CreateWindowExA a echoue (erreur %lu)",
+                      (unsigned long)GetLastError());
         free(win);
         return NULL;
     }
@@ -1896,6 +2145,7 @@ GtWindow* gtCreateWindow(const char* title, int width, int height) {
         sizeof(uint32_t)
     );
     if (!win->buffer) {
+        gtReportError("gtCreateWindow : allocation framebuffer OOM (%dx%d)", width, height);
         DestroyWindow(win->hwnd);
         free(win);
         return NULL;
@@ -1945,10 +2195,14 @@ void gtDestroyWindow(GtWindow* window) {
 bool gtEventsWindow(GtWindow* window) {
     if (!window) return false;
 
-    // Copie l'état courant vers prev AVANT de traiter les nouveaux messages
-    // (pour edge detection : pressed/released cette frame)
-    memcpy(window->keys_prev, window->keys, sizeof(window->keys));
-    memcpy(window->mouse_buttons_prev, window->mouse_buttons, sizeof(window->mouse_buttons));
+    // Vide les événements de la frame précédente AVANT le pump : tout ce qui
+    // arrive pendant (WM_KEYDOWN/UP, clics, WM_CHAR, molette) appartient à
+    // CETTE frame. Compteurs = aucun appui rapide n'est perdu.
+    memset(window->key_pressed_count, 0, sizeof(window->key_pressed_count));
+    memset(window->key_released_count, 0, sizeof(window->key_released_count));
+    memset(window->mouse_pressed_count, 0, sizeof(window->mouse_pressed_count));
+    memset(window->mouse_released_count, 0, sizeof(window->mouse_released_count));
+    window->mouse_wheel_delta = 0;
 
     // Vide la saisie de texte de la frame précédente : les WM_CHAR arrivant
     // pendant le pump ci-dessous s'accumulent pour CETTE frame.
@@ -2248,26 +2502,26 @@ void gtGetMousePos(GtWindow* window, int* out_x, int* out_y) {
 // Retourne true seulement sur la frame où la touche passe de relâchée -> enfoncée
 bool gtWasKeyPressed(GtWindow* window, int keycode) {
     if (!window || keycode < 0 || keycode >= 256) return false;
-    return window->keys[keycode] && !window->keys_prev[keycode];
+    return window->key_pressed_count[keycode] > 0;  // appui frais cette frame
 }
 
 // Vérifie si une touche vient d'être relâchée CETTE frame (edge detection)
 // Retourne true seulement sur la frame où la touche passe de enfoncée -> relâchée
 bool gtWasKeyReleased(GtWindow* window, int keycode) {
     if (!window || keycode < 0 || keycode >= 256) return false;
-    return !window->keys[keycode] && window->keys_prev[keycode];
+    return window->key_released_count[keycode] > 0; // relâchement frais cette frame
 }
 
 // Vérifie si un bouton souris vient d'être pressé CETTE frame
 bool gtWasMouseButtonPressed(GtWindow* window, int button) {
     if (!window || button < 0 || button >= 3) return false;
-    return window->mouse_buttons[button] && !window->mouse_buttons_prev[button];
+    return window->mouse_pressed_count[button] > 0;  // clic frais cette frame
 }
 
 // Vérifie si un bouton souris vient d'être relâché CETTE frame
 bool gtWasMouseButtonReleased(GtWindow* window, int button) {
     if (!window || button < 0 || button >= 3) return false;
-    return !window->mouse_buttons[button] && window->mouse_buttons_prev[button];
+    return window->mouse_released_count[button] > 0; // relâchement frais cette frame
 }
 
 // Récupère le delta de la molette souris depuis la dernière frame
@@ -2275,9 +2529,9 @@ bool gtWasMouseButtonReleased(GtWindow* window, int button) {
 // Remet à zéro après lecture (consommer l'événement)
 int gtGetMouseWheelDelta(GtWindow* window) {
     if (!window) return 0;
-    int delta = window->mouse_wheel_delta;
-    window->mouse_wheel_delta = 0;
-    return delta;
+    // Lecture STABLE : vidangé au début de chaque gtEventsWindow, pas ici —
+    // plusieurs systèmes peuvent lire la même valeur dans la même frame.
+    return window->mouse_wheel_delta;
 }
 
 // Caractères tapés cette frame : vidés au début de chaque gtEventsWindow,
@@ -2562,6 +2816,7 @@ struct GtRenderer {
 
     // Caméra active (optionnelle)
     GtCamera* camera;
+    bool camera_seeded;   // true tant que slot 0 = copie caméra non écrasée par SetTransform
 
 #ifndef LIBGT_NO_D2D
     // ---- Backend Direct2D ----
@@ -2578,6 +2833,7 @@ struct GtRenderer {
     IDWriteTextFormat* dwrite_formats[GT_D2D_MAX_FONT_FORMATS];
     float dwrite_format_px[GT_D2D_MAX_FONT_FORMATS];
     int dwrite_format_count;
+    int dwrite_evict_next;   // slot a evictor quand le cache est plein
     wchar_t dwrite_font[64];               // Nom de police (défaut "Segoe UI")
 #endif
 };
@@ -2651,8 +2907,10 @@ static ID2D1RenderTarget* gtD2DEnsureRT(GtRenderer* r) {
     D2D1_RENDER_TARGET_PROPERTIES rtp;
     rtp.type = r->d2d_software ? D2D1_RENDER_TARGET_TYPE_SOFTWARE : D2D1_RENDER_TARGET_TYPE_DEFAULT;
     rtp.pixelFormat = pf;
-    rtp.dpiX = 0.0f;
-    rtp.dpiY = 0.0f;
+    // 96 DPI explicite : 1 unite = 1 pixel. A 0 (DPI bureau), l'espace serait
+    // en DIPs et serait etire sur les affichages a mise a l'echelle > 100%.
+    rtp.dpiX = 96.0f;
+    rtp.dpiY = 96.0f;
     rtp.usage = D2D1_RENDER_TARGET_USAGE_NONE;
     rtp.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
 
@@ -2717,7 +2975,9 @@ static void gtD2DEndFrame(GtRenderer* r) {
 // Brosse cachée (indexation directe par hash couleur) : évite de recréer
 // un COM object à chaque draw quand les couleurs alternent.
 static ID2D1SolidColorBrush* gtD2DGetBrush(ID2D1RenderTarget* rt, GtD2DPaint* paint, GtColor color) {
-    uint32_t slot = (color * 2654435761u) % GT_D2D_BRUSH_CACHE;
+    // >> 24 : le modulo seul ne dependait que des 8 bits bas de la couleur
+    // (le canal bleu) - deux couleurs partageant leur octet bas s'evictaient.
+    uint32_t slot = ((color * 2654435761u) >> 24) % GT_D2D_BRUSH_CACHE;
     GtD2DBrushEntry* e = &paint->brushes[slot];
     if (e->brush && e->color == (uint32_t)color) return e->brush;
     if (e->brush) ID2D1SolidColorBrush_Release(e->brush);
@@ -3005,10 +3265,16 @@ static void gtD2DDrawTextRun(ID2D1RenderTarget* rt, GtD2DPaint* paint, ID2D1Bitm
 // Crée un renderer pour une fenêtre
 // type : GT_RENDERER_GDI ou GT_RENDERER_D2D
 GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type) {
-    if (!window) return NULL;
+    if (!window) {
+        gtReportError("gtCreateRenderer : fenetre NULL");
+        return NULL;
+    }
 
     GtRenderer* renderer = (GtRenderer*)calloc(1, sizeof(GtRenderer));
-    if (!renderer) return NULL;
+    if (!renderer) {
+        gtReportError("gtCreateRenderer : allocation OOM");
+        return NULL;
+    }
 
     renderer->window = window;
     renderer->type = GT_RENDERER_GDI;
@@ -3040,6 +3306,8 @@ GtRenderer* gtCreateRenderer(GtWindow* window, GtRendererType type) {
         // Échec (DLL absente, OOM) : reste sur GDI ? Non — retour NULL pour
         // que l'appelant sache que le backend demandé est indisponible.
         if (renderer->type != GT_RENDERER_D2D) {
+            gtReportError("gtCreateRenderer : Direct2D indisponible (hr=0x%08lX)",
+                          (unsigned long)hr);
             free(renderer);
             return NULL;
         }
@@ -3175,6 +3443,8 @@ static bool gtD2DWinClear(GtWindow* win, uint32_t color) {
     if (!gtD2DBeginDraw(r)) return false;
     ID2D1RenderTarget* rt = (ID2D1RenderTarget*)r->d2d_rt;
     D2D1_COLOR_F c = gtD2DColor(color);
+    c.a = 1.0f;  // clear opaque : un alpha < 1 rend la fenêtre semi-transparente
+                 // via DWM (compositing imprévisible) — on l'interdit ici.
     ID2D1RenderTarget_Clear(rt, &c);
     return true;
 }
@@ -3299,11 +3569,27 @@ static IDWriteTextFormat* gtD2DGetTextFormat(GtRenderer* r, float font_px) {
     for (int i = 0; i < r->dwrite_format_count; i++) {
         if (r->dwrite_format_px[i] == font_px) return r->dwrite_formats[i];
     }
-    int idx;
     if (r->dwrite_format_count >= GT_D2D_MAX_FONT_FORMATS) {
-        idx = 0;  // cache plein : réutilise le premier slot
-    } else {
-        idx = r->dwrite_format_count;
+        // Cache plein : eviction round-robin (remplace le slot le plus ancien
+        // par le nouveau format - l'ancien comportement reutilisait betement
+        // le slot 0 et rendait la taille de police du premier slot).
+        int slot = r->dwrite_evict_next % GT_D2D_MAX_FONT_FORMATS;
+        r->dwrite_evict_next++;
+        IDWriteFactory* f = gtD2DEnsureDWrite(r);
+        if (!f) return NULL;
+        IDWriteTextFormat* fmt = NULL;
+        HRESULT hr = IDWriteFactory_CreateTextFormat(f, r->dwrite_font, NULL,
+                                                     DWRITE_FONT_WEIGHT_NORMAL,
+                                                     DWRITE_FONT_STYLE_NORMAL,
+                                                     DWRITE_FONT_STRETCH_NORMAL,
+                                                     font_px, L"en-US", &fmt);
+        if (FAILED(hr)) return NULL;
+        if (r->dwrite_formats[slot]) IDWriteTextFormat_Release(r->dwrite_formats[slot]);
+        r->dwrite_formats[slot] = fmt;
+        r->dwrite_format_px[slot] = font_px;
+        return fmt;
+    }
+    int idx = r->dwrite_format_count;
         IDWriteFactory* f = gtD2DEnsureDWrite(r);
         if (!f) return NULL;
         IDWriteTextFormat* fmt = NULL;
@@ -3316,7 +3602,6 @@ static IDWriteTextFormat* gtD2DGetTextFormat(GtRenderer* r, float font_px) {
         r->dwrite_formats[idx] = fmt;
         r->dwrite_format_px[idx] = font_px;
         r->dwrite_format_count++;
-    }
     return r->dwrite_formats[idx];
 }
 
@@ -3419,6 +3704,7 @@ void gtRendererClear(GtRenderer* renderer, GtColor color) {
         if (!gtD2DBeginDraw(renderer)) return;
         ID2D1RenderTarget* rt = (ID2D1RenderTarget*)renderer->d2d_rt;
         D2D1_COLOR_F c = gtD2DColor(color);
+        c.a = 1.0f;  // clear opaque (compositing DWM prévisible), cf. gtD2DWinClear
         ID2D1RenderTarget_Clear(rt, &c);
         return;
     }
@@ -3646,6 +3932,13 @@ void gtRendererDrawCircleLines(GtRenderer* renderer, int cx, int cy, int radius,
 // Helper interne : obtient la matrice courante (identité si stack vide)
 static inline const GtMat3* gtRendererGetCurrentTransform(const GtRenderer* renderer) {
     if (!renderer || renderer->transform_stack_depth == 0) return NULL;
+    // Caméra live : tant que slot 0 est la copie caméra (non écrasée par
+    // SetTransform), on retourne la view matrix DIRECTEMENT — déplacer la
+    // caméra entre deux dessins suffit, plus besoin de re-SetCamera.
+    if (renderer->camera_seeded && renderer->transform_stack_depth == 1 && renderer->camera) {
+        gtCameraEnsureUpdated(renderer->camera);
+        return &renderer->camera->view_matrix;
+    }
     return &renderer->transform_stack[renderer->transform_stack_depth - 1];
 }
 
@@ -3697,6 +3990,7 @@ static inline void gtRendererApplyTransformRect(const GtRenderer* renderer,
 
 void gtRendererSetTransform(GtRenderer* renderer, const GtMat3* transform) {
     if (!renderer) return;
+    renderer->camera_seeded = false;  // l'utilisateur écrase le slot caméra
 
     if (renderer->transform_stack_depth == 0) {
         if (!transform) return;
@@ -3722,6 +4016,7 @@ void gtRendererPushTransform(GtRenderer* renderer) {
 
     if (renderer->transform_stack_depth == 0) {
         renderer->transform_stack[0] = gtMat3Identity();
+        renderer->camera_seeded = false;  // identité, plus la caméra
     } else {
         renderer->transform_stack[renderer->transform_stack_depth] =
             renderer->transform_stack[renderer->transform_stack_depth - 1];
@@ -3740,6 +4035,10 @@ void gtRendererMultiplyTransform(GtRenderer* renderer, const GtMat3* m) {
 
     if (renderer->transform_stack_depth == 0) {
         gtRendererPushTransform(renderer);
+    }
+
+    if (renderer->transform_stack_depth == 1) {
+        renderer->camera_seeded = false;  // on modifie le slot caméra
     }
 
     GtMat3* current = &renderer->transform_stack[renderer->transform_stack_depth - 1];
@@ -3767,12 +4066,16 @@ void gtRendererSetCamera(GtRenderer* renderer, const GtCamera* camera) {
     renderer->camera = (GtCamera*)camera;
 
     if (camera) {
+        // Matrices fraîches même si l'appelant a oublié gtCameraUpdate
+        gtCameraEnsureUpdated(camera);
         if (renderer->transform_stack_depth == 0) {
             gtRendererPushTransform(renderer);
         }
         renderer->transform_stack[0] = camera->view_matrix;
+        renderer->camera_seeded = true;
     } else {
         renderer->transform_stack_depth = 0;
+        renderer->camera_seeded = false;
     }
 }
 
@@ -4154,24 +4457,30 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
         ID2D1Bitmap* bmp = gtD2DGetTintedBitmap(rt, &renderer->d2d, image, tint);
         if (!bmp) return;
 
-        // Rect destination : (x,y) = point d'ancrage défini par origin
+        // Rect destination en espace LOCAL : (0,0)-(w,h). La matrice porte
+        // TOUTE la translation vers l'ecran (dx,dy) - dessiner le rect en
+        // (dx,dy) sous une matrice contenant deja T(dx,dy) doublait la
+        // position. L'ancre (x,y) correspond au point local
+        // (origin.x*w, origin.y*h) : c'est le pivot de rotation.
         float dx = (float)x - origin.x * (float)w;
         float dy = (float)y - origin.y * (float)h;
 
-        // M = user . T(anchor) . R(rot) . T(-anchor) . T(center) . S(flip) . T(-center)
+        // M = user . T(dx,dy) . T(ancre) . R(rot) . T(-ancre) . T(centre) . S(flip) . T(-centre)
         // (ordre col-major : le flip s'applique d'abord, puis la rotation)
         GtMat3 m = gtMat3Translate(dx, dy);
         if (flip_x || flip_y) {
-            float fcx = dx + (float)w * 0.5f;
-            float fcy = dy + (float)h * 0.5f;
+            float fcx = (float)w * 0.5f;
+            float fcy = (float)h * 0.5f;
             m = gtMat3Mul(m, gtMat3Translate(fcx, fcy));
             m = gtMat3Mul(m, gtMat3Scale(flip_x ? -1.0f : 1.0f, flip_y ? -1.0f : 1.0f));
             m = gtMat3Mul(m, gtMat3Translate(-fcx, -fcy));
         }
         if (rot != 0.0f) {
-            m = gtMat3Mul(m, gtMat3Translate((float)x, (float)y));
+            float ax = origin.x * (float)w;
+            float ay = origin.y * (float)h;
+            m = gtMat3Mul(m, gtMat3Translate(ax, ay));
             m = gtMat3Mul(m, gtMat3Rotate(rot));
-            m = gtMat3Mul(m, gtMat3Translate(-(float)x, -(float)y));
+            m = gtMat3Mul(m, gtMat3Translate(-ax, -ay));
         }
         const GtMat3* user = gtRendererGetCurrentTransform(renderer);
         GtMat3 total = user ? gtMat3Mul(*user, m) : m;
@@ -4179,8 +4488,8 @@ void gtRendererDrawImageEx(GtRenderer* renderer, GtImage* image,
         D2D1_MATRIX_3X2_F dm = gtD2DMatrix(&total);
         ID2D1RenderTarget_SetTransform(rt, &dm);
         D2D1_RECT_F dst;
-        dst.left = dx; dst.top = dy;
-        dst.right = dx + (float)w; dst.bottom = dy + (float)h;
+        dst.left = 0.0f; dst.top = 0.0f;
+        dst.right = (float)w; dst.bottom = (float)h;
         ID2D1RenderTarget_DrawBitmap(rt, bmp, &dst, 1.0f,
                                      D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL);
         return;
@@ -4642,7 +4951,10 @@ GtBatchRenderer* gtBatchCreate(GtRenderer* renderer, const GtBatchConfig* config
     if (cfg.max_images <= 0) cfg.max_images = 256;
     
     GtBatchRenderer* batch = (GtBatchRenderer*)calloc(1, sizeof(GtBatchRenderer));
-    if (!batch) return NULL;
+    if (!batch) {
+        gtReportError("gtBatchCreate : allocation OOM");
+        return NULL;
+    }
     
     batch->renderer = renderer;
     batch->config = cfg;
@@ -4651,6 +4963,7 @@ GtBatchRenderer* gtBatchCreate(GtRenderer* renderer, const GtBatchConfig* config
     batch->images = (GtImage**)malloc((size_t)cfg.max_images * sizeof(GtImage*));
     
     if (!batch->vertices || !batch->images) {
+        gtReportError("gtBatchCreate : allocation des buffers OOM");
         gtBatchDestroy(batch);
         return NULL;
     }
@@ -5017,16 +5330,19 @@ void gtBatchAddText(GtBatchRenderer* batch, const char* text, float x, float y,
     int cur_x = (int)p.x;
     int cur_y = (int)p.y;
     
-    for (const char* c = text; *c; c++) {
-        if (*c == '\n') {
+    for (const char* c = text; *c; ) {
+        int code = gtTextNextGlyph(&c);       // decode UTF-8/CP-1252, avance c
+        if (code < 0) break;
+        if (code == '\n') {
             cur_x = (int)p.x;
             cur_y += (int)(8 * scale) + spacing;
             continue;
         }
-        if (*c < 32 || *c > 126) continue;
+        int gi = gtGlyphIndexForCode(code);
+        if (gi < 0) { cur_x += char_w + spacing; continue; }
 
         // Un quad par caractère ; le flush échantillonne la bitmap font 8x8
-        gtBatchEmitGlyph(batch, (float)cur_x, (float)cur_y, (float)char_w, (float)(8 * scale), color, *c, scale);
+        gtBatchEmitGlyph(batch, (float)cur_x, (float)cur_y, (float)char_w, (float)(8 * scale), color, (char)gi, scale);
         cur_x += char_w + spacing;
     }
 }
@@ -5119,19 +5435,24 @@ GtImage* gtLoadImage(const char* filepath, int* out_width, int* out_height) {
     if (!filepath) return NULL;
 
     FILE* f = fopen(filepath, "rb");
-    if (!f) return NULL;
+    if (!f) {
+        gtReportError("gtLoadImage : fichier introuvable (%s)", filepath);
+        return NULL;
+    }
 
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
 
     if (file_size <= 0) {
+        gtReportError("gtLoadImage : fichier vide (%s)", filepath);
         fclose(f);
         return NULL;
     }
 
     unsigned char* file_data = (unsigned char*)malloc((size_t)file_size);
     if (!file_data) {
+        gtReportError("gtLoadImage : allocation OOM (%s)", filepath);
         fclose(f);
         return NULL;
     }
@@ -5140,6 +5461,7 @@ GtImage* gtLoadImage(const char* filepath, int* out_width, int* out_height) {
     fclose(f);
 
     if (read_bytes != (size_t)file_size) {
+        gtReportError("gtLoadImage : lecture incomplete (%s)", filepath);
         free(file_data);
         return NULL;
     }
@@ -5148,10 +5470,15 @@ GtImage* gtLoadImage(const char* filepath, int* out_width, int* out_height) {
     unsigned char* pixels = stbi_load_from_memory(file_data, (int)file_size, &w, &h, &channels, 4);
     free(file_data);
 
-    if (!pixels) return NULL;
+    if (!pixels) {
+        gtReportError("gtLoadImage : format non supporte ou image corrompue (%s)", filepath);
+        return NULL;
+    }
 
     // Alloue GtImage
-    GtImage* image = (GtImage*)malloc(sizeof(GtImage));
+    // calloc : les champs de cache D2D (d2d_bitmap/d2d_owner) doivent etre
+    // a zero - gtFreeImage libere d2d_bitmap si non-NULL.
+    GtImage* image = (GtImage*)calloc(1, sizeof(GtImage));
     if (!image) {
         stbi_image_free(pixels);
         return NULL;
@@ -5216,10 +5543,10 @@ uint32_t* gtImageGetPixels(GtImage* image) {
 * ------------------------------------------------------------------------- */
 // Version interne scalée (utilisée par gtDrawTextEx)
 static void gtDrawCharScaled(GtWindow* window, int x, int y, char c, uint32_t color, float scale) {
-    if (c < 32 || c > 126) return;  // Hors police (ASCII 32-126)
-
-    int idx = (int)c - 32;
-    const uint8_t* glyph = &gt_font8x8[idx * 8];
+    int idx = gtGlyphIndexForCode((unsigned char)c);  // ASCII + accents CP-1252
+    if (idx < 0) return;
+    const uint8_t* glyph = gtFontGlyphData(idx);
+    if (!glyph) return;
 
     if (scale == 1.0f) {
         // Version optimisée 1x
@@ -5311,8 +5638,10 @@ void gtDrawTextEx(GtWindow* window, int x, int y, const char* text, uint32_t col
     int char_w = (int)(8 * scale);
     int line_h = (int)(8 * scale) + spacing;
 
-    for (const char* p = text; *p; p++) {
-        char c = *p;
+    for (const char* p = text; *p; ) {
+        int code = gtTextNextGlyph(&p);       // decode UTF-8/CP-1252, avance p
+        if (code < 0) break;
+        char c = (char)code;
 
         // Gestion saut de ligne explicite
         if (c == '\n') {
@@ -5376,8 +5705,10 @@ void gtMeasureText(const char* text, float scale, int spacing, int wrap_width,
     int cur_y = 0;
     int max_w = 0;
 
-    for (const char* p = text; *p; p++) {
-        char c = *p;
+    for (const char* p = text; *p; ) {
+        int code = gtTextNextGlyph(&p);       // decode UTF-8/CP-1252, avance p
+        if (code < 0) break;
+        char c = (char)code;
 
         if (c == '\n') {
             if (cur_x > max_w) max_w = cur_x;
@@ -6303,13 +6634,55 @@ bool gtECSCheckCircleBox(const GtECS* ecs, GtEntity circle_e, GtEntity box_e) {
 // (Une vraie broad phase — grille spatiale ou sort-and-sweep — serait une
 // extension future ; le snapshot de handles ci-dessous reste nécessaire
 // dans tous les cas pour la sécurité des callbacks.)
+// Teste une paire d'entites (layers/masks + formes) et invoque on_hit si contact.
+// Factorise : utilise par le chemin O(n^2) ET par la grille spatiale. Les
+// pointeurs sont re-resolus a chaque appel car le callback peut detruire
+// des entites ou retirer des composants en cours de route.
+static void gtECSTestPair(GtECS* ecs, GtEntity ent_a, GtEntity ent_b,
+                          GtECSCollisionFunc on_hit, void* user_data) {
+    if (!gtECSIsAlive(ecs, ent_a) || !gtECSIsAlive(ecs, ent_b)) return;
+
+    GtCollider* col_a = gtECSGetCollider(ecs, ent_a);
+    GtCollider* col_b = gtECSGetCollider(ecs, ent_b);
+    if (!col_a || !col_b) return;
+    if (!gtECSGetTransform(ecs, ent_a) || !gtECSGetTransform(ecs, ent_b)) return;
+
+    // Verifie layers/masks dans les deux sens.
+    if ((col_a->mask & col_b->layer) == 0 || (col_b->mask & col_a->layer) == 0) return;
+
+    bool hit = false;
+    if (col_a->type == GT_COLLIDER_CIRCLE && col_b->type == GT_COLLIDER_CIRCLE) {
+        hit = gtECSCheckCircleCircle(ecs, ent_a, ent_b);
+    } else if (col_a->type == GT_COLLIDER_BOX && col_b->type == GT_COLLIDER_BOX) {
+        hit = gtECSCheckBoxBox(ecs, ent_a, ent_b);
+    } else if (col_a->type == GT_COLLIDER_CIRCLE && col_b->type == GT_COLLIDER_BOX) {
+        hit = gtECSCheckCircleBox(ecs, ent_a, ent_b);
+    } else if (col_a->type == GT_COLLIDER_BOX && col_b->type == GT_COLLIDER_CIRCLE) {
+        hit = gtECSCheckCircleBox(ecs, ent_b, ent_a);
+    }
+
+    if (hit) {
+        // Il n'y a pas encore de solver physique dans libGT : le callback
+        // est donc le mecanisme de reaction, trigger ou collision solide.
+        on_hit(ecs, ent_a, ent_b, user_data);
+    }
+}
+
+// Extension (rayon / demi-extent max) d'un collider, pour la grille
+static float gtECSColliderExtent(const GtCollider* col) {
+    if (col->type == GT_COLLIDER_CIRCLE) return col->circle.radius;
+    float hx = col->box.half_extents.x;
+    float hy = col->box.half_extents.y;
+    return (hx > hy) ? hx : hy;
+}
+
 void gtECSSystemCollisions(GtECS* ecs, GtECSCollisionFunc on_hit, void* user_data) {
     if (!ecs || !on_hit || !ecs->alive || !ecs->masks ||
         !ecs->generations || !ecs->colliders || !ecs->transforms) return;
     if (ecs->alive_count < 2) return;
 
-    // Snapshot des handles, pas seulement des indices : si le callback détruit
-    // puis recrée une entité pendant la boucle, l'ancienne handle reste invalide.
+    // Snapshot des handles, pas seulement des indices : si le callback detruit
+    // puis recree une entite pendant la boucle, l'ancienne handle reste invalide.
     GtEntity* entities = (GtEntity*)malloc((size_t)ecs->alive_count * sizeof(*entities));
     if (!entities) return;
 
@@ -6321,51 +6694,156 @@ void gtECSSystemCollisions(GtECS* ecs, GtECSCollisionFunc on_hit, void* user_dat
         entities[count++] = GT_ENTITY_MAKE(idx, ecs->generations[idx]);
     }
 
-    for (int i = 0; i < count; i++) {
-        GtEntity ent_a = entities[i];
-        if (!gtECSIsAlive(ecs, ent_a)) continue;
-
-        // Pré-check avant la boucle interne. Les pointeurs sont re-résolus
-        // à CHAQUE itération ci-dessous, car le callback on_hit peut
-        // détruire des entités ou retirer des composants en cours de route.
-        if (!gtECSGetCollider(ecs, ent_a) || !gtECSGetTransform(ecs, ent_a)) continue;
-
-        for (int j = i + 1; j < count; j++) {
-            GtEntity ent_b = entities[j];
-            if (!gtECSIsAlive(ecs, ent_a) || !gtECSIsAlive(ecs, ent_b)) continue;
-
-            GtCollider* col_a = gtECSGetCollider(ecs, ent_a);
-            GtCollider* col_b = gtECSGetCollider(ecs, ent_b);
-            if (!col_a || !col_b) continue;
-            if (!gtECSGetTransform(ecs, ent_a) || !gtECSGetTransform(ecs, ent_b)) continue;
-
-            uint32_t layer_a = col_a->layer;
-            uint32_t mask_a = col_a->mask;
-            uint32_t layer_b = col_b->layer;
-            uint32_t mask_b = col_b->mask;
-
-            // Vérifie layers/masks dans les deux sens.
-            if ((mask_a & layer_b) == 0 || (mask_b & layer_a) == 0) continue;
-
-            bool hit = false;
-            if (col_a->type == GT_COLLIDER_CIRCLE && col_b->type == GT_COLLIDER_CIRCLE) {
-                hit = gtECSCheckCircleCircle(ecs, ent_a, ent_b);
-            } else if (col_a->type == GT_COLLIDER_BOX && col_b->type == GT_COLLIDER_BOX) {
-                hit = gtECSCheckBoxBox(ecs, ent_a, ent_b);
-            } else if (col_a->type == GT_COLLIDER_CIRCLE && col_b->type == GT_COLLIDER_BOX) {
-                hit = gtECSCheckCircleBox(ecs, ent_a, ent_b);
-            } else if (col_a->type == GT_COLLIDER_BOX && col_b->type == GT_COLLIDER_CIRCLE) {
-                hit = gtECSCheckCircleBox(ecs, ent_b, ent_a);
+    // Petit nombre d'entites : O(n^2) direct (la grille coute plus cher)
+    if (count <= 32) {
+        for (int i = 0; i < count; i++) {
+            if (!gtECSIsAlive(ecs, entities[i])) continue;
+            if (!gtECSGetCollider(ecs, entities[i])) continue;
+            for (int j = i + 1; j < count; j++) {
+                gtECSTestPair(ecs, entities[i], entities[j], on_hit, user_data);
             }
+        }
+        free(entities);
+        return;
+    }
 
-            if (hit) {
-                // Il n'y a pas encore de solver physique dans libGT : le callback
-                // est donc le mécanisme de réaction, trigger ou collision solide.
-                on_hit(ecs, ent_a, ent_b, user_data);
+    // ---- Grille spatiale uniforme (O(n) typique) ----
+    // Cellule = 2x le plus grand collider ; grille bornee a 64x64 cellules
+    // (au-dela, on double la taille de cellule). Deux passes d'insertion en
+    // arena : zero allocation par bucket.
+    float cell = 1.0f;
+    for (int i = 0; i < count; i++) {
+        GtCollider* col = gtECSGetCollider(ecs, entities[i]);
+        if (col) {
+            float ext = gtECSColliderExtent(col);
+            if (ext > cell) cell = ext;
+        }
+    }
+    cell *= 2.0f;
+
+    float min_x = 0.0f, min_y = 0.0f, max_x = 0.0f, max_y = 0.0f;
+    bool have_bounds = false;
+    for (int i = 0; i < count; i++) {
+        GtTransform* t = gtECSGetTransform(ecs, entities[i]);
+        if (!t) continue;
+        if (!have_bounds) {
+            min_x = max_x = t->pos.x;
+            min_y = max_y = t->pos.y;
+            have_bounds = true;
+        } else {
+            if (t->pos.x < min_x) min_x = t->pos.x;
+            if (t->pos.x > max_x) max_x = t->pos.x;
+            if (t->pos.y < min_y) min_y = t->pos.y;
+            if (t->pos.y > max_y) max_y = t->pos.y;
+        }
+    }
+    if (!have_bounds) { free(entities); return; }
+
+    int gw = (int)((max_x - min_x) / cell) + 1;
+    int gh = (int)((max_y - min_y) / cell) + 1;
+    while (gw * gh > 64 * 64) {   // grille trop grande : cellules plus larges
+        cell *= 2.0f;
+        gw = (int)((max_x - min_x) / cell) + 1;
+        gh = (int)((max_y - min_y) / cell) + 1;
+    }
+    int ncells = gw * gh;
+
+    int* cell_start = (int*)calloc((size_t)ncells + 1, sizeof(int));
+    int* cell_items = (int*)malloc((size_t)count * 8 * sizeof(int)); // >= 4 cellules/entite
+    int* tested_with = (int*)malloc((size_t)count * sizeof(int));
+    if (!cell_start || !cell_items || !tested_with) {
+        // Grille impossible : repli sur l'O(n^2)
+        free(cell_start); free(cell_items); free(tested_with);
+        for (int i = 0; i < count; i++) {
+            if (!gtECSIsAlive(ecs, entities[i])) continue;
+            for (int j = i + 1; j < count; j++)
+                gtECSTestPair(ecs, entities[i], entities[j], on_hit, user_data);
+        }
+        free(entities);
+        return;
+    }
+    for (int i = 0; i < count; i++) tested_with[i] = -1;
+
+    // Passe 1 : comptage des insertions par cellule
+    for (int i = 0; i < count; i++) {
+        GtTransform* t = gtECSGetTransform(ecs, entities[i]);
+        GtCollider* col = gtECSGetCollider(ecs, entities[i]);
+        if (!t || !col) continue;
+        float ext = gtECSColliderExtent(col);
+        float ox = (col->offset.x >= 0) ? col->offset.x : -col->offset.x;
+        float oy = (col->offset.y >= 0) ? col->offset.y : -col->offset.y;
+        ext += (ox > oy) ? ox : oy;
+        int cx0 = (int)((t->pos.x - ext - min_x) / cell); if (cx0 < 0) cx0 = 0;
+        int cx1 = (int)((t->pos.x + ext - min_x) / cell); if (cx1 >= gw) cx1 = gw - 1;
+        int cy0 = (int)((t->pos.y - ext - min_y) / cell); if (cy0 < 0) cy0 = 0;
+        int cy1 = (int)((t->pos.y + ext - min_y) / cell); if (cy1 >= gh) cy1 = gh - 1;
+        for (int cy = cy0; cy <= cy1; cy++)
+            for (int cx = cx0; cx <= cx1; cx++)
+                cell_start[cy * gw + cx + 1]++;
+    }
+    for (int c = 0; c < ncells; c++) cell_start[c + 1] += cell_start[c];
+
+    // Passe 2 : remplissage de l'arena
+    int* cursor = (int*)malloc((size_t)ncells * sizeof(int));
+    if (!cursor) {
+        free(cell_start); free(cell_items); free(tested_with);
+        for (int i = 0; i < count; i++)
+            for (int j = i + 1; j < count; j++)
+                gtECSTestPair(ecs, entities[i], entities[j], on_hit, user_data);
+        free(entities);
+        return;
+    }
+    for (int c = 0; c < ncells; c++) cursor[c] = cell_start[c];
+    for (int i = 0; i < count; i++) {
+        GtTransform* t = gtECSGetTransform(ecs, entities[i]);
+        GtCollider* col = gtECSGetCollider(ecs, entities[i]);
+        if (!t || !col) continue;
+        float ext = gtECSColliderExtent(col);
+        float ox = (col->offset.x >= 0) ? col->offset.x : -col->offset.x;
+        float oy = (col->offset.y >= 0) ? col->offset.y : -col->offset.y;
+        ext += (ox > oy) ? ox : oy;
+        int cx0 = (int)((t->pos.x - ext - min_x) / cell); if (cx0 < 0) cx0 = 0;
+        int cx1 = (int)((t->pos.x + ext - min_x) / cell); if (cx1 >= gw) cx1 = gw - 1;
+        int cy0 = (int)((t->pos.y - ext - min_y) / cell); if (cy0 < 0) cy0 = 0;
+        int cy1 = (int)((t->pos.y + ext - min_y) / cell); if (cy1 >= gh) cy1 = gh - 1;
+        for (int cy = cy0; cy <= cy1; cy++)
+            for (int cx = cx0; cx <= cx1; cx++)
+                cell_items[cursor[cy * gw + cx]++] = i;
+    }
+    free(cursor);
+
+    // Paires : chaque entite interroge ses cellules ; j > i garantit un test
+    // unique par paire (deux colliders en contact partagent au moins une cellule).
+    for (int i = 0; i < count; i++) {
+        if (!gtECSIsAlive(ecs, entities[i])) continue;
+        GtTransform* t = gtECSGetTransform(ecs, entities[i]);
+        GtCollider* col = gtECSGetCollider(ecs, entities[i]);
+        if (!t || !col) continue;
+        float ext = gtECSColliderExtent(col);
+        float ox = (col->offset.x >= 0) ? col->offset.x : -col->offset.x;
+        float oy = (col->offset.y >= 0) ? col->offset.y : -col->offset.y;
+        ext += (ox > oy) ? ox : oy;
+        int cx0 = (int)((t->pos.x - ext - min_x) / cell); if (cx0 < 0) cx0 = 0;
+        int cx1 = (int)((t->pos.x + ext - min_x) / cell); if (cx1 >= gw) cx1 = gw - 1;
+        int cy0 = (int)((t->pos.y - ext - min_y) / cell); if (cy0 < 0) cy0 = 0;
+        int cy1 = (int)((t->pos.y + ext - min_y) / cell); if (cy1 >= gh) cy1 = gh - 1;
+        for (int cy = cy0; cy <= cy1; cy++) {
+            for (int cx = cx0; cx <= cx1; cx++) {
+                int c = cy * gw + cx;
+                for (int k = cell_start[c]; k < cell_start[c + 1]; k++) {
+                    int j = cell_items[k];
+                    if (j <= i) continue;              // paire deja testee (ou soi-meme)
+                    if (tested_with[j] == i) continue; // deja vu dans une autre cellule
+                    tested_with[j] = i;
+                    gtECSTestPair(ecs, entities[i], entities[j], on_hit, user_data);
+                }
             }
         }
     }
 
+    free(cell_start);
+    free(cell_items);
+    free(tested_with);
     free(entities);
 }
 
